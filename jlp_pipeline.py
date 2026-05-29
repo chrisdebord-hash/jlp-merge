@@ -589,28 +589,50 @@ def _ocr_page(page) -> str:
     return pytesseract.image_to_string(img, config="--psm 11")
 
 
-def _ocr_page_max_measure(page) -> "int | None":
+def _ocr_page_max_measure(page, full_page: bool = False) -> "int | None":
     """
-    OCR the bottom 20% and top 15% of a page (fitz auto-corrects /Rotate).
-    Returns the highest standalone integer 1-999 found — the last measure number
-    visible on that page.  Used to read total measure count from the last PDF page.
+    Return the highest standalone integer 1-999 on a page — the last measure
+    number visible on that page.  fitz auto-corrects /Rotate so no PIL rotation needed.
+
+    full_page=False (default, last-page mode):
+        Try bottom 20% + top 15% strips first (fast path — measure numbers
+        normally cluster there on the final page).  Fall back to full-page OCR
+        if strips return nothing, e.g. when numbers live inside rehearsal-mark
+        boxes in the middle of the page.
+
+    full_page=True (penultimate/earlier-page mode):
+        Skip strips and OCR the whole page directly, because on non-final pages
+        the highest-numbered measures appear in the middle, not the bottom strip.
     """
     mat = fitz.Matrix(OCR_DPI / 72, OCR_DPI / 72)
     pix = page.get_pixmap(matrix=mat)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     w, h = img.size
 
-    regions = [
-        img.crop((0, int(h * 0.80), w, h)),   # bottom 20%
-        img.crop((0, 0, w, int(h * 0.15))),    # top 15% (rehearsal numbers)
-    ]
-    nums = []
-    for region in regions:
-        text = pytesseract.image_to_string(region, config="--psm 11")
+    def _nums_from_text(text):
+        result = []
         for m in re.finditer(r"(?<!\d)\d{1,3}(?!\d)", text):
             n = int(m.group())
             if 1 <= n <= 999:
-                nums.append(n)
+                result.append(n)
+        return result
+
+    if not full_page:
+        # Fast path: strips where measure numbers normally appear on a final page
+        regions = [
+            img.crop((0, int(h * 0.80), w, h)),   # bottom 20%
+            img.crop((0, 0, w, int(h * 0.15))),    # top 15%
+        ]
+        nums = []
+        for region in regions:
+            nums.extend(_nums_from_text(
+                pytesseract.image_to_string(region, config="--psm 11")
+            ))
+        if nums:
+            return max(nums)
+
+    # Full-page scan (fallback for last page; default for earlier pages)
+    nums = _nums_from_text(pytesseract.image_to_string(img, config="--psm 11"))
     return max(nums) if nums else None
 
 
@@ -750,6 +772,8 @@ def phase_check(args):
         print(f"   Source PDF : {pdf_path.name}")
 
         # ── Step 1: OCR last page to get total measure count (cheap, cached) ───
+        # If the last page is blank (common back/cover page), try up to 3 pages
+        # from the end so a blank final page doesn't silently block the estimate.
         last_score_m = None
         if (
             not args.force
@@ -761,10 +785,21 @@ def phase_check(args):
         else:
             doc = fitz.open(str(pdf_path))
             total_pages = len(doc)
-            last_score_m = _ocr_page_max_measure(doc[-1])
+            score_page_note = ""
+            for back in range(min(3, total_pages)):
+                # Use full-page OCR for earlier pages: high-numbered measures
+                # appear in the middle of the page, not just the bottom strip.
+                candidate = _ocr_page_max_measure(doc[-(back + 1)], full_page=(back > 0))
+                if candidate is not None:
+                    last_score_m = candidate
+                    if back > 0:
+                        score_page_note = (
+                            f" (p.{total_pages - back} — last {back} page(s) blank)"
+                        )
+                    break
             doc.close()
             if last_score_m is not None:
-                print(f"   Score total: ~m{last_score_m} (last-page OCR)")
+                print(f"   Score total: ~m{last_score_m} (OCR{score_page_note})")
                 cached["last_score_measure"] = last_score_m
                 cached["pdf_path"]           = str(pdf_path)
                 cached["total_pages"]        = total_pages
@@ -796,6 +831,30 @@ def phase_check(args):
         else:
             page_0, total_pages = scan_pdf_for_measure(pdf_path, last_m)
             if page_0 is None:
+                # 10% tolerance fallback: if last XML measure is within 10% of the
+                # estimated score total, the score is almost certainly complete and
+                # the OCR simply couldn't find the exact page.
+                if last_score_m is not None and last_m >= last_score_m * 0.9:
+                    print(f"   ✓ Complete (OCR fallback) — m{last_m} is within 10% of "
+                          f"score total m{last_score_m}. Ready to merge.")
+                    cached["complete"]     = True
+                    cached["last_measure"] = last_m
+                    save_state(state)
+                    complete_count += 1
+                    print()
+                    continue
+                # Single-page fallback: if there is only one page there is nowhere
+                # to extract a next chunk from regardless of completeness — the merge
+                # will use whatever measures are available.
+                if total_pages == 1:
+                    print(f"   ✓ Complete (no further pages) — PDF has 1 page; "
+                          f"merging available measures (m{last_m}).")
+                    cached["complete"]     = True
+                    cached["last_measure"] = last_m
+                    save_state(state)
+                    complete_count += 1
+                    print()
+                    continue
                 print(f"   [warning] Could not locate m{last_m} in {pdf_path.name}.")
                 print()
                 incomplete_count += 1
