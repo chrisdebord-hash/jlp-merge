@@ -21,6 +21,7 @@ import argparse
 import io
 import json
 import re
+import shutil
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
@@ -29,8 +30,9 @@ from pathlib import Path
 from statistics import median as _median
 
 from jlp_common import (
-    SOURCE_DIR, EXPORTS_DIR, RAW_DIR, NEXT_DIR, MERGED_DIR, ASSEMBLED_DIR,
-    STATE_FILE, ALL_DIRS, INSTRUMENTS, CUE_TEMPOS, GM_DEFAULT,
+    SOURCE_DIR, EXPORTS_DIR, RAW_DIR, PROCESSED_DIR, NEXT_DIR,
+    MERGED_DIR, ASSEMBLED_DIR, STATE_FILE, ALL_DIRS, INSTRUMENTS,
+    CUE_TEMPOS, GM_DEFAULT,
 )
 
 try:
@@ -1079,6 +1081,11 @@ def phase_merge(args):
         result = _merge_group(inst, cue, title, xml_paths)
         if result:
             merged_count += 1
+            PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+            for xml_path in xml_paths:
+                dest = PROCESSED_DIR / xml_path.name
+                shutil.move(str(xml_path), str(dest))
+                print(f"   Moved to processed/: {xml_path.name}")
         print()
 
     print(f"Summary: {merged_count} merged, {skipped_count} skipped")
@@ -1180,13 +1187,18 @@ def _cue_sort(c: str):
 def phase_status(args):
     state = load_state()
 
-    raw_groups    = group_raw_xmls(RAW_DIR)
-    merged_groups = group_merged_mxls(MERGED_DIR)
+    raw_groups       = group_raw_xmls(RAW_DIR)
+    processed_groups = group_raw_xmls(PROCESSED_DIR) if PROCESSED_DIR.exists() else {}
+    merged_groups    = group_merged_mxls(MERGED_DIR)
 
     merged_set: set = set()
     for (cue, _), inst_files in merged_groups.items():
         for inst, _ in inst_files:
             merged_set.add((inst, cue))
+    # XMLs in processed/ were successfully merged — count them even if the
+    # merged MXL was manually removed.
+    for inst, cue, _title in processed_groups:
+        merged_set.add((inst, cue))
 
     assembled_cues: set = set()
     if ASSEMBLED_DIR.exists():
@@ -1198,6 +1210,8 @@ def phase_status(args):
     # Always show all 44 defined cues; add any extra from actual data
     all_cues: set = set(CUE_TEMPOS.keys())
     for inst, cue, title in raw_groups:
+        all_cues.add(cue)
+    for inst, cue, title in processed_groups:
         all_cues.add(cue)
     for cue, title in merged_groups:
         all_cues.add(cue)

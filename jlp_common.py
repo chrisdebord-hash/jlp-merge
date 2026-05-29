@@ -11,6 +11,7 @@ SOURCE_DIR = Path("/Users/chrisdebord/Library/Mobile Documents/com~apple~CloudDo
 # ─── Working directories ─────────────────────────────────────────────────────
 EXPORTS_DIR   = Path("/Users/chrisdebord/Library/Mobile Documents/com~apple~CloudDocs/FYL/Jagged Little Pill/exports")
 RAW_DIR       = EXPORTS_DIR / "raw"          # user drops XMLs here
+PROCESSED_DIR = EXPORTS_DIR / "processed"    # XMLs moved here after successful merge
 NEXT_DIR      = EXPORTS_DIR / "next_pdfs"    # script writes chunk PDFs here
 MERGED_DIR    = EXPORTS_DIR / "merged"       # per-instrument merged MXLs
 ASSEMBLED_DIR = EXPORTS_DIR / "assembled"    # full-score MXLs per cue
@@ -18,7 +19,7 @@ READY_DIR     = EXPORTS_DIR / "ready"        # final Logic-ready MXLs
 
 STATE_FILE    = EXPORTS_DIR / ".jlp_state.json"
 
-ALL_DIRS = [RAW_DIR, NEXT_DIR, MERGED_DIR, ASSEMBLED_DIR, READY_DIR]
+ALL_DIRS = [RAW_DIR, PROCESSED_DIR, NEXT_DIR, MERGED_DIR, ASSEMBLED_DIR, READY_DIR]
 
 # ─── Instruments ─────────────────────────────────────────────────────────────
 INSTRUMENTS = [
