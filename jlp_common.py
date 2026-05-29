@@ -6,10 +6,10 @@ import re
 from pathlib import Path
 
 # ─── Source PDFs (read-only) ─────────────────────────────────────────────────
-SOURCE_DIR = Path("/Users/chrisdebord/Google Drive/My Drive/JLP")
+SOURCE_DIR = Path("/Users/chrisdebord/Library/Mobile Documents/com~apple~CloudDocs/FYL/Jagged Little Pill/scores")
 
 # ─── Working directories ─────────────────────────────────────────────────────
-EXPORTS_DIR   = Path("/Users/chrisdebord/Google Drive/My Drive/JLP/exports")
+EXPORTS_DIR   = Path("/Users/chrisdebord/Library/Mobile Documents/com~apple~CloudDocs/FYL/Jagged Little Pill/exports")
 RAW_DIR       = EXPORTS_DIR / "raw"          # user drops XMLs here
 NEXT_DIR      = EXPORTS_DIR / "next_pdfs"    # script writes chunk PDFs here
 MERGED_DIR    = EXPORTS_DIR / "merged"       # per-instrument merged MXLs

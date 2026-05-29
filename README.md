@@ -125,14 +125,16 @@ Highlights anything that has a source PDF but no merged MXL yet.
 
 ## Directory layout
 
+Base: `~/Library/Mobile Documents/com~apple~CloudDocs/FYL/Jagged Little Pill/`
+
 | Location | Purpose |
 |----------|---------|
-| `/Users/chrisdebord/Google Drive/My Drive/JLP/{instrument}/` | Source PDFs (read-only) |
-| `.../JLP/exports/raw/` | Drop PlayScore XML exports here |
-| `.../JLP/exports/next_pdfs/` | Script writes next-chunk PDFs here |
-| `.../JLP/exports/merged/` | Per-instrument merged MXLs |
-| `.../JLP/exports/assembled/` | Full-score MXLs per cue |
-| `.../JLP/exports/ready/` | Final Logic-ready MXLs |
+| `scores/{instrument}/` | Source PDFs (read-only) |
+| `exports/raw/` | Drop PlayScore XML exports here |
+| `exports/next_pdfs/` | Script writes next-chunk PDFs here |
+| `exports/merged/` | Per-instrument merged MXLs |
+| `exports/assembled/` | Full-score MXLs per cue |
+| `exports/ready/` | Final Logic-ready MXLs |
 
 **File naming convention:**
 
