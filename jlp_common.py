@@ -9,17 +9,20 @@ from pathlib import Path
 SOURCE_DIR = Path("/Users/chrisdebord/Library/Mobile Documents/com~apple~CloudDocs/FYL/Jagged Little Pill/scores")
 
 # ─── Working directories ─────────────────────────────────────────────────────
-EXPORTS_DIR   = Path("/Users/chrisdebord/Library/Mobile Documents/com~apple~CloudDocs/FYL/Jagged Little Pill/exports")
-RAW_DIR       = EXPORTS_DIR / "raw"          # user drops XMLs here
-PROCESSED_DIR = EXPORTS_DIR / "processed"    # XMLs moved here after successful merge
-NEXT_DIR      = EXPORTS_DIR / "next_pdfs"    # script writes chunk PDFs here
-MERGED_DIR    = EXPORTS_DIR / "merged"       # per-instrument merged MXLs
-ASSEMBLED_DIR = EXPORTS_DIR / "assembled"    # full-score MXLs per cue
-READY_DIR     = EXPORTS_DIR / "ready"        # final Logic-ready MXLs
+EXPORTS_DIR      = Path("/Users/chrisdebord/Library/Mobile Documents/com~apple~CloudDocs/FYL/Jagged Little Pill/exports")
+RAW_DIR          = EXPORTS_DIR / "raw"          # user drops XMLs here
+PROCESSED_DIR    = EXPORTS_DIR / "processed"    # legacy; superseded by trash/
+NEXT_DIR         = EXPORTS_DIR / "next_pdfs"    # chunk PDFs awaiting PlayScore import
+MERGED_DIR       = EXPORTS_DIR / "merged"       # per-instrument merged MXLs
+ASSEMBLED_DIR    = EXPORTS_DIR / "assembled"    # full-score MXLs per cue
+READY_DIR        = EXPORTS_DIR / "ready"        # final Logic-ready MXLs
+TRASH_DIR        = EXPORTS_DIR / "trash"        # consumed XMLs and chunk PDFs
+TRASH_MERGED_DIR = TRASH_DIR   / "merged"       # chunk PDFs from fully merged cues
 
-STATE_FILE    = EXPORTS_DIR / ".jlp_state.json"
+STATE_FILE     = EXPORTS_DIR / ".jlp_state.json"
+OVERRIDES_FILE = EXPORTS_DIR / "overrides.json"
 
-ALL_DIRS = [RAW_DIR, PROCESSED_DIR, NEXT_DIR, MERGED_DIR, ASSEMBLED_DIR, READY_DIR]
+ALL_DIRS = [RAW_DIR, NEXT_DIR, MERGED_DIR, ASSEMBLED_DIR, READY_DIR, TRASH_DIR]
 
 # ─── Instruments ─────────────────────────────────────────────────────────────
 INSTRUMENTS = [

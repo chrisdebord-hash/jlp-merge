@@ -30,8 +30,9 @@ from pathlib import Path
 from statistics import median as _median
 
 from jlp_common import (
-    SOURCE_DIR, EXPORTS_DIR, RAW_DIR, PROCESSED_DIR, NEXT_DIR,
-    MERGED_DIR, ASSEMBLED_DIR, STATE_FILE, ALL_DIRS, INSTRUMENTS,
+    SOURCE_DIR, EXPORTS_DIR, RAW_DIR, NEXT_DIR,
+    MERGED_DIR, ASSEMBLED_DIR, TRASH_DIR, TRASH_MERGED_DIR,
+    STATE_FILE, OVERRIDES_FILE, ALL_DIRS, INSTRUMENTS,
     CUE_TEMPOS, GM_DEFAULT,
 )
 
@@ -67,6 +68,8 @@ OCTAVE_CEILINGS = {
     "viola":  72,
     "violin": 72,
 }
+
+_SINGLE_STAFF = {"bass", "cello", "guitar1", "guitar2", "viola", "violin", "percussion"}
 
 SWITCH_PATTERNS = [
     ("STEEL STRING", {"guitar1": 25, "guitar2": 25}),
@@ -303,6 +306,20 @@ def load_state() -> dict:
 def save_state(state: dict):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def load_overrides() -> set:
+    if OVERRIDES_FILE.exists():
+        try:
+            return set(json.loads(OVERRIDES_FILE.read_text()))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return set()
+
+
+def save_overrides(overrides: set):
+    OVERRIDES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OVERRIDES_FILE.write_text(json.dumps(sorted(overrides), indent=2))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -777,6 +794,29 @@ def phase_check(args):
 
     for d in ALL_DIRS:
         d.mkdir(parents=True, exist_ok=True)
+    TRASH_MERGED_DIR.mkdir(parents=True, exist_ok=True)
+
+    state     = load_state()
+    overrides = load_overrides()
+
+    # Process --mark-complete flags before scanning
+    if args.mark_complete:
+        for token in args.mark_complete:
+            if ":" not in token:
+                print(f"[warning] --mark-complete: ignoring {token!r} (expected inst:cue)")
+                continue
+            inst_mc, cue_mc = token.split(":", 1)
+            inst_mc = inst_mc.lower()
+            cue_mc  = cue_mc.upper()
+            if inst_mc not in INSTRUMENTS:
+                print(f"[warning] --mark-complete: unknown instrument {inst_mc!r}")
+                continue
+            key = f"{inst_mc}.{cue_mc}"
+            overrides.add(key)
+            state.setdefault(key, {})["complete"] = True
+            print(f"[override] Marked complete: {inst_mc} cue {cue_mc}")
+        save_overrides(overrides)
+        save_state(state)
 
     groups = group_raw_xmls(RAW_DIR, filter_inst=args.instrument, filter_cue=args.cue)
 
@@ -785,7 +825,6 @@ def phase_check(args):
         print("Drop your PlayScore XML exports there and re-run.")
         return
 
-    state           = load_state()
     complete_entries: list = []   # "inst cue XX" for complete instruments
     chunk_pdfs:      list = []    # Path objects for generated chunk PDFs
 
@@ -807,6 +846,16 @@ def phase_check(args):
         state_key = f"{inst}.{cue}"
         cached    = state.setdefault(state_key, {})
 
+        # Check manual override
+        if state_key in overrides:
+            print(f"   ✓ Complete (manual override). Ready to merge.")
+            cached["complete"]     = True
+            cached["last_measure"] = last_m
+            save_state(state)
+            complete_entries.append(f"{inst} cue {cue}")
+            print()
+            continue
+
         pdf_path = _find_source_pdf(inst, cue, title)
         if pdf_path is None:
             print(f"   [warning] Source PDF not found.")
@@ -816,8 +865,6 @@ def phase_check(args):
         print(f"   Source PDF : {pdf_path.name}")
 
         # ── Step 1: OCR last page to get total measure count (cheap, cached) ───
-        # If the last page is blank (common back/cover page), try up to 3 pages
-        # from the end so a blank final page doesn't silently block the estimate.
         last_score_m = None
         if (
             not args.force
@@ -825,7 +872,17 @@ def phase_check(args):
             and "last_score_measure" in cached
         ):
             last_score_m = cached["last_score_measure"]
-            print(f"   (cached) score total: ~m{last_score_m}")
+            # Retroactively cap if cached before cap logic was added
+            if inst in _SINGLE_STAFF and last_score_m > 300:
+                total_pages_est = cached.get("total_pages", 1)
+                fallback = total_pages_est * 30
+                print(f"   [warning] Cached score total {last_score_m} > 300 — OCR error; "
+                      f"using page estimate {fallback} ({total_pages_est} pages × 30)")
+                last_score_m = fallback
+                cached["last_score_measure"] = last_score_m
+                save_state(state)
+            else:
+                print(f"   (cached) score total: ~m{last_score_m}")
         else:
             doc = fitz.open(str(pdf_path))
             total_pages = len(doc)
@@ -843,6 +900,11 @@ def phase_check(args):
                     break
             doc.close()
             if last_score_m is not None:
+                if inst in _SINGLE_STAFF and last_score_m > 300:
+                    fallback = total_pages * 30
+                    print(f"   [warning] OCR score total {last_score_m} > 300 — OCR error; "
+                          f"using page estimate {fallback} ({total_pages} pages × 30)")
+                    last_score_m = fallback
                 print(f"   Score total: ~m{last_score_m} (OCR{score_page_note})")
                 cached["last_score_measure"] = last_score_m
                 cached["pdf_path"]           = str(pdf_path)
@@ -863,7 +925,6 @@ def phase_check(args):
             continue
 
         # ── Step 3: Incomplete — find cutoff page, extract remaining pages ────
-        # Use cached cutoff-page result if last_m hasn't changed
         if (
             not args.force
             and cached.get("last_measure") == last_m
@@ -875,9 +936,6 @@ def phase_check(args):
         else:
             page_0, total_pages = scan_pdf_for_measure(pdf_path, last_m)
             if page_0 is None:
-                # 10% tolerance fallback: if last XML measure is within 10% of the
-                # estimated score total, the score is almost certainly complete and
-                # the OCR simply couldn't find the exact page.
                 if last_score_m is not None and last_m >= last_score_m * 0.9:
                     print(f"   ✓ Complete (OCR fallback) — m{last_m} is within 10% of "
                           f"score total m{last_score_m}. Ready to merge.")
@@ -887,9 +945,6 @@ def phase_check(args):
                     complete_entries.append(f"{inst} cue {cue}")
                     print()
                     continue
-                # Single-page fallback: if there is only one page there is nowhere
-                # to extract a next chunk from regardless of completeness — the merge
-                # will use whatever measures are available.
                 if total_pages == 1:
                     print(f"   ✓ Complete (no further pages) — PDF has 1 page; "
                           f"merging available measures (m{last_m}).")
@@ -908,9 +963,6 @@ def phase_check(args):
             cached["complete"]            = False
             save_state(state)
 
-        # If the cutoff page is the last page, nothing remains — mark complete.
-        # (Happens when last-page OCR returns a number slightly above last_m due to
-        # other numbers visible on the page, but the XML actually covers everything.)
         if page_0 + 1 >= total_pages:
             print(f"   ✓ Complete — m{last_m} is on the last page. Ready to merge.")
             cached["complete"]     = True
@@ -920,14 +972,27 @@ def phase_check(args):
             print()
             continue
 
-        # Extract remaining pages after the cutoff page
+        # ── Step 4: Loop detection ────────────────────────────────────────────
+        if cached.get("last_generated_for_measure") == last_m:
+            print(
+                f"\n[warning] {inst} cue {cue}: PlayScore has exported m{last_m} twice "
+                f"in a row from the same pages. PlayScore may have hit its recognition "
+                f"limit on this chunk. Options:\n"
+                f"   a) Try importing a smaller chunk (1-2 pages at a time)\n"
+                f"   b) Mark as complete if you believe all music is captured: "
+                f"--mark-complete {inst}:{cue}\n"
+                f"   c) Skip for now and continue with other instruments"
+            )
+            print()
+            continue
+
+        # ── Step 5: Extract remaining pages ──────────────────────────────────
         next_suf   = next_suffix(latest_suffix)
         chunk_name = f"JLP.{inst}.{cue}.{title}.{next_suf}.pdf"
         chunk_path = NEXT_DIR / chunk_name
         n_pages    = extract_pages_fixed(pdf_path, page_0 + 1, chunk_path)
 
         if n_pages == 0:
-            # All remaining pages were navigation/marker-only — nothing left to export
             print(f"   ✓ Complete — remaining pages are navigation markers only. Ready to merge.")
             cached["complete"]     = True
             cached["last_measure"] = last_m
@@ -936,7 +1001,18 @@ def phase_check(args):
             print()
             continue
 
-        # PlayScore strips dots when naming the XML after the imported PDF
+        # Move the consumed chunk PDF (the one that produced latest_path) to trash
+        if latest_suffix is not None:
+            consumed_name = f"JLP.{inst}.{cue}.{title}.{latest_suffix}.pdf"
+            consumed_pdf  = NEXT_DIR / consumed_name
+            if consumed_pdf.exists():
+                TRASH_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(consumed_pdf), str(TRASH_DIR / consumed_name))
+                print(f"   Moved to trash/: {consumed_name}")
+
+        cached["last_generated_for_measure"] = last_m
+        save_state(state)
+
         ps_name = chunk_path.stem.replace(".", "") + ".xml"
         print(f"   → Chunk PDF : {chunk_path.name}")
         print(f"      Pages {page_0 + 2}–{total_pages} ({n_pages} page(s))")
@@ -947,7 +1023,6 @@ def phase_check(args):
     # ── Actionable summary ────────────────────────────────────────────────────
     print()
     if chunk_pdfs and complete_entries:
-        # Mixed: some need more work, some are ready
         print("═══ ACTION REQUIRED ═══")
         print("Import these PDFs into PlayScore and export XMLs to the raw folder:")
         for i, cp in enumerate(chunk_pdfs, 1):
@@ -959,14 +1034,12 @@ def phase_check(args):
         print("  " + ", ".join(complete_entries))
         print("Run: python3 jlp_pipeline.py --phase merge")
     elif chunk_pdfs:
-        # Nothing complete yet — only action items
         print("═══ ACTION REQUIRED ═══")
         print("Import these PDFs into PlayScore and export XMLs to the raw folder:")
         for i, cp in enumerate(chunk_pdfs, 1):
             print(f"  {i}. {cp.name}  →  {cp.parent}")
         print(f"When done, re-run: python3 jlp_pipeline.py --phase check")
     elif complete_entries:
-        # Everything that could be checked is complete
         print("═══ ALL COMPLETE ═══")
         print("All exports done. Run: python3 jlp_pipeline.py --phase merge")
 
@@ -1081,11 +1154,21 @@ def phase_merge(args):
         result = _merge_group(inst, cue, title, xml_paths)
         if result:
             merged_count += 1
-            PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+            TRASH_DIR.mkdir(parents=True, exist_ok=True)
             for xml_path in xml_paths:
-                dest = PROCESSED_DIR / xml_path.name
+                dest = TRASH_DIR / xml_path.name
                 shutil.move(str(xml_path), str(dest))
-                print(f"   Moved to processed/: {xml_path.name}")
+                print(f"   Moved to trash/: {xml_path.name}")
+            # Move matching chunk PDFs from trash/ into trash/merged/
+            TRASH_MERGED_DIR.mkdir(parents=True, exist_ok=True)
+            chunk_pdf_pat = re.compile(
+                r"^JLP\." + re.escape(inst) + r"\." + re.escape(cue) + r"\.",
+                re.IGNORECASE,
+            )
+            for f in sorted(TRASH_DIR.iterdir()):
+                if f.suffix.lower() == ".pdf" and chunk_pdf_pat.match(f.name):
+                    shutil.move(str(f), str(TRASH_MERGED_DIR / f.name))
+                    print(f"   Moved to trash/merged/: {f.name}")
         print()
 
     print(f"Summary: {merged_count} merged, {skipped_count} skipped")
@@ -1187,17 +1270,17 @@ def _cue_sort(c: str):
 def phase_status(args):
     state = load_state()
 
-    raw_groups       = group_raw_xmls(RAW_DIR)
-    processed_groups = group_raw_xmls(PROCESSED_DIR) if PROCESSED_DIR.exists() else {}
-    merged_groups    = group_merged_mxls(MERGED_DIR)
+    raw_groups   = group_raw_xmls(RAW_DIR)
+    trash_groups = group_raw_xmls(TRASH_DIR) if TRASH_DIR.exists() else {}
+    merged_groups = group_merged_mxls(MERGED_DIR)
 
     merged_set: set = set()
     for (cue, _), inst_files in merged_groups.items():
         for inst, _ in inst_files:
             merged_set.add((inst, cue))
-    # XMLs in processed/ were successfully merged — count them even if the
+    # XMLs in trash/ were successfully merged — count them even if the
     # merged MXL was manually removed.
-    for inst, cue, _title in processed_groups:
+    for inst, cue, _title in trash_groups:
         merged_set.add((inst, cue))
 
     assembled_cues: set = set()
@@ -1211,7 +1294,7 @@ def phase_status(args):
     all_cues: set = set(CUE_TEMPOS.keys())
     for inst, cue, title in raw_groups:
         all_cues.add(cue)
-    for inst, cue, title in processed_groups:
+    for inst, cue, title in trash_groups:
         all_cues.add(cue)
     for cue, title in merged_groups:
         all_cues.add(cue)
@@ -1304,6 +1387,8 @@ phases:
                    help="Filter to one instrument")
     p.add_argument("--force", action="store_true",
                    help="Re-process even if output already exists / result cached")
+    p.add_argument("--mark-complete", nargs="+", default=[], metavar="INST:CUE",
+                   help="Force inst:cue pairs complete, e.g. bass:01 violin:01")
     return p.parse_args()
 
 
