@@ -50,6 +50,15 @@ OCR_DPI = 200
 
 _STEP_MIDI = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 
+# Navigation/marker pages that carry no musical content and should be skipped
+# when building chunk PDFs.  Matched against fitz-extracted text (case-insensitive).
+_NAV_PATTERN = re.compile(
+    r'\bv\.?s\.?\b'         # V.S. / VS  (Volti Subito — turn page quickly)
+    r'|\bvolti\s+subito\b'  # full spelling
+    r'|\btacet\b',          # tacet — instrument is silent for the movement
+    re.IGNORECASE,
+)
+
 OCTAVE_CEILINGS = {
     "bass":   52,   # E3
     "cello":  72,   # C5
@@ -668,12 +677,42 @@ def scan_pdf_for_measure(pdf_path: Path, measure_num: int, hint_page: int | None
     return None, total
 
 
+def _is_navigation_page(page) -> bool:
+    """
+    Return True if this page carries no musical content and should be skipped
+    when building a chunk PDF.
+
+    Two detection paths:
+    - Text-based PDF: fitz text contains a known navigation marker (V.S., tacet,
+      etc.) and has no measure numbers (integers 1-999).  A real music page that
+      merely mentions "V.S." in a direction still has measure numbers, so it won't
+      be filtered.
+    - Rasterised PDF (no text layer): render at 72 DPI and measure ink coverage.
+      Real music pages are ≥ 8% ink; blank/V.S.-arrow pages are < 2%.
+    """
+    text = page.get_text("text").strip()
+    if text:
+        if _NAV_PATTERN.search(text):
+            # Only skip if no measure numbers are present on the same page
+            if not re.search(r"(?<!\d)\d{1,3}(?!\d)", text):
+                return True
+        return False
+
+    # No text layer — fall back to pixel coverage check
+    mat = fitz.Matrix(1.0, 1.0)   # 72 DPI; fast and enough for coverage estimate
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+    non_white = sum(1 for b in pix.samples if b < 240)
+    coverage = non_white / len(pix.samples) if pix.samples else 0
+    return coverage < 0.02        # < 2% ink → blank or near-blank
+
+
 def extract_pages_fixed(src_path: Path, from_page_0: int, output_path: Path) -> int:
     """
-    Extract pages [from_page_0 .. end] to output_path.
-    Pages with /Rotate metadata are re-rendered (rotation baked in) so PlayScore
-    receives upright pages with no rotation flag.
-    Returns the number of pages written.
+    Extract pages [from_page_0 .. end] to output_path, skipping navigation/
+    marker-only pages (V.S. indicators, blank spacer pages, etc.).
+    Pages with /Rotate metadata are re-rendered so PlayScore receives upright
+    pages with no rotation flag.
+    Returns the number of music pages written (0 if only nav pages remained).
     """
     src   = fitz.open(str(src_path))
     total = len(src)
@@ -681,6 +720,9 @@ def extract_pages_fixed(src_path: Path, from_page_0: int, output_path: Path) -> 
 
     for idx in range(from_page_0, total):
         src_page = src[idx]
+        if _is_navigation_page(src_page):
+            print(f"   (skipping navigation/marker page {idx + 1}/{total})")
+            continue
         if src_page.rotation == 0:
             out.insert_pdf(src, from_page=idx, to_page=idx)
         else:
@@ -691,11 +733,13 @@ def extract_pages_fixed(src_path: Path, from_page_0: int, output_path: Path) -> 
             new_pg  = out.new_page(width=w, height=h)
             new_pg.insert_image(fitz.Rect(0, 0, w, h), pixmap=pix)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    out.save(str(output_path))
+    n_written = len(out)
+    if n_written > 0:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        out.save(str(output_path))
     src.close()
     out.close()
-    return total - from_page_0
+    return n_written
 
 
 def _find_source_pdf(inst: str, cue: str, title: str) -> "Path | None":
@@ -879,6 +923,16 @@ def phase_check(args):
         chunk_name = f"JLP.{inst}.{cue}.{title}.{next_suf}.pdf"
         chunk_path = NEXT_DIR / chunk_name
         n_pages    = extract_pages_fixed(pdf_path, page_0 + 1, chunk_path)
+
+        if n_pages == 0:
+            # All remaining pages were navigation/marker-only — nothing left to export
+            print(f"   ✓ Complete — remaining pages are navigation markers only. Ready to merge.")
+            cached["complete"]     = True
+            cached["last_measure"] = last_m
+            save_state(state)
+            complete_entries.append(f"{inst} cue {cue}")
+            print()
+            continue
 
         # PlayScore strips dots when naming the XML after the imported PDF
         ps_name = chunk_path.stem.replace(".", "") + ".xml"
