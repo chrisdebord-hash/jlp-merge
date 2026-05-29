@@ -510,6 +510,31 @@ def _ocr_page(page) -> str:
     return pytesseract.image_to_string(img, config="--psm 11")
 
 
+def _ocr_page_max_measure(page) -> "int | None":
+    """
+    OCR the bottom 20% and top 15% of a page (fitz auto-corrects /Rotate).
+    Returns the highest standalone integer 1-999 found — the last measure number
+    visible on that page.  Used to read total measure count from the last PDF page.
+    """
+    mat = fitz.Matrix(OCR_DPI / 72, OCR_DPI / 72)
+    pix = page.get_pixmap(matrix=mat)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    w, h = img.size
+
+    regions = [
+        img.crop((0, int(h * 0.80), w, h)),   # bottom 20%
+        img.crop((0, 0, w, int(h * 0.15))),    # top 15% (rehearsal numbers)
+    ]
+    nums = []
+    for region in regions:
+        text = pytesseract.image_to_string(region, config="--psm 11")
+        for m in re.finditer(r"(?<!\d)\d{1,3}(?!\d)", text):
+            n = int(m.group())
+            if 1 <= n <= 999:
+                nums.append(n)
+    return max(nums) if nums else None
+
+
 def scan_pdf_for_measure(pdf_path: Path, measure_num: int, hint_page: int | None = None):
     """
     Find the first page of pdf_path containing measure_num (±2).
@@ -613,8 +638,8 @@ def phase_check(args):
         print("Drop your PlayScore XML exports there and re-run.")
         return
 
-    state = load_state()
-    complete_count  = 0
+    state            = load_state()
+    complete_count   = 0
     incomplete_count = 0
 
     print(f"\nFound {len(groups)} instrument/cue group(s) in {RAW_DIR}\n")
@@ -634,79 +659,92 @@ def phase_check(args):
         print(f"   Latest : {latest_path.name}  (last measure: m{last_m})")
 
         state_key = f"{inst}.{cue}"
-        cached    = state.get(state_key, {})
-        pdf_path  = None
+        cached    = state.setdefault(state_key, {})
 
-        use_cache = (
+        pdf_path = _find_source_pdf(inst, cue, title)
+        if pdf_path is None:
+            print(f"   [warning] Source PDF not found.")
+            print(f"   Expected: {SOURCE_DIR}/{inst}/JLP.{inst}.{cue}.{title}.pdf")
+            print()
+            incomplete_count += 1
+            continue
+        print(f"   Source PDF : {pdf_path.name}")
+
+        # ── Step 1: OCR last page to get total measure count (cheap, cached) ───
+        last_score_m = None
+        if (
+            not args.force
+            and cached.get("pdf_path") == str(pdf_path)
+            and "last_score_measure" in cached
+        ):
+            last_score_m = cached["last_score_measure"]
+            print(f"   (cached) score total: ~m{last_score_m}")
+        else:
+            doc = fitz.open(str(pdf_path))
+            total_pages = len(doc)
+            last_score_m = _ocr_page_max_measure(doc[-1])
+            doc.close()
+            if last_score_m is not None:
+                print(f"   Score total: ~m{last_score_m} (last-page OCR)")
+                cached["last_score_measure"] = last_score_m
+                cached["pdf_path"]           = str(pdf_path)
+                cached["total_pages"]        = total_pages
+                save_state(state)
+            else:
+                print(f"   [warning] Could not read measure count from last page of "
+                      f"{pdf_path.name} — will scan forward.")
+
+        # ── Step 2: Determine completeness ────────────────────────────────────
+        if last_score_m is not None and last_m >= last_score_m:
+            print(f"   ✓ Complete — m{last_m} >= m{last_score_m} (score total). Ready to merge.")
+            cached["complete"]     = True
+            cached["last_measure"] = last_m
+            save_state(state)
+            complete_count += 1
+            print()
+            continue
+
+        # ── Step 3: Incomplete — find cutoff page, extract remaining pages ────
+        # Use cached cutoff-page result if last_m hasn't changed
+        if (
             not args.force
             and cached.get("last_measure") == last_m
             and "last_measure_page_0" in cached
-        )
-
-        if use_cache:
+        ):
             page_0      = cached["last_measure_page_0"]
-            total_pages = cached["total_pages"]
-            complete    = cached["complete"]
+            total_pages = cached.get("total_pages", cached["last_measure_page_0"] + 1)
             print(f"   (cached) m{last_m} on page {page_0 + 1}/{total_pages}")
-            cached_pdf = cached.get("pdf_path", "")
-            if cached_pdf:
-                pdf_path = Path(cached_pdf)
         else:
-            pdf_path = _find_source_pdf(inst, cue, title)
-            if pdf_path is None:
-                print(f"   [warning] Source PDF not found.")
-                print(f"   Expected: {SOURCE_DIR}/{inst}/JLP.{inst}.{cue}.{title}.pdf")
-                print()
-                incomplete_count += 1
-                continue
-            print(f"   Source PDF : {pdf_path.name}")
             page_0, total_pages = scan_pdf_for_measure(pdf_path, last_m)
             if page_0 is None:
                 print(f"   [warning] Could not locate m{last_m} in {pdf_path.name}.")
-                print(f"   Re-run with a manual page override if scan fails.")
                 print()
                 incomplete_count += 1
                 continue
-            complete = (page_0 + 1 >= total_pages)
-            state[state_key] = {
-                "last_measure":        last_m,
-                "last_measure_page_0": page_0,
-                "total_pages":         total_pages,
-                "complete":            complete,
-                "pdf_path":            str(pdf_path),
-            }
+            cached["last_measure"]        = last_m
+            cached["last_measure_page_0"] = page_0
+            cached["total_pages"]         = total_pages
+            cached["complete"]            = False
             save_state(state)
 
-        if complete:
-            print(f"   ✓ Complete — m{last_m} is the last page. Ready to merge.")
-            complete_count += 1
-        else:
-            # Resolve pdf_path for extraction if coming from cache
-            if pdf_path is None or not pdf_path.exists():
-                pdf_path = _find_source_pdf(inst, cue, title)
+        # Extract remaining pages after the cutoff page
+        next_suf   = next_suffix(latest_suffix)
+        chunk_name = f"JLP.{inst}.{cue}.{title}.{next_suf}.pdf"
+        chunk_path = NEXT_DIR / chunk_name
+        n_pages    = extract_pages_fixed(pdf_path, page_0 + 1, chunk_path)
 
-            next_suf   = next_suffix(latest_suffix)
-            chunk_name = f"JLP.{inst}.{cue}.{title}.{next_suf}.pdf"
-            chunk_path = NEXT_DIR / chunk_name
-
-            if pdf_path and pdf_path.exists():
-                n_pages = extract_pages_fixed(pdf_path, page_0 + 1, chunk_path)
-                print(f"   → Chunk PDF : {chunk_path}")
-                print(f"      Pages {page_0 + 2}–{total_pages} ({n_pages} page(s))")
-            else:
-                print(f"   [error] Source PDF unavailable; cannot write chunk PDF.")
-
-            next_xml = f"JLP.{inst}.{cue}.{title}.{next_suf}.xml"
-            print(f"   → Save your next PlayScore export as:")
-            print(f"        {next_xml}")
-            print(f"      Drop it in: {RAW_DIR}")
-            incomplete_count += 1
-
+        next_xml = f"JLP.{inst}.{cue}.{title}.{next_suf}.xml"
+        print(f"   → Chunk PDF : {chunk_path.name}")
+        print(f"      Pages {page_0 + 2}–{total_pages} ({n_pages} page(s))")
+        print(f"   → Save your next PlayScore export as:")
+        print(f"        {next_xml}")
+        print(f"      Drop it in: {RAW_DIR}")
+        incomplete_count += 1
         print()
 
     print(f"Summary: {complete_count} complete, {incomplete_count} incomplete")
     if complete_count:
-        print(f"Run --phase merge to process complete groups.")
+        print("Run --phase merge to process complete groups.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -763,7 +801,7 @@ def _merge_group(inst: str, cue: str, title: str, xml_paths: list) -> "Path | No
 
     # Switch detection
     for mn, pat, prog in detect_and_inject_switches(merged, inst):
-        print(f"   switch m{mn}: {pat} → GM {prog}")
+        print(f"   Switch: {inst} cue {cue} m{mn} → {pat} (GM {prog})")
 
     # Tempo
     if not src_has_tempo:
@@ -853,6 +891,13 @@ def phase_assemble(args):
             continue
 
         inst_list = [i for i, _ in inst_files]
+        missing   = [i for i in INSTRUMENTS if i not in inst_list]
+        if missing and not args.force:
+            print(f"── cue {cue}  skipped "
+                  f"(missing {len(missing)} instrument(s): {', '.join(missing)})")
+            print(f"      Use --force to assemble with available instruments only.")
+            skipped_count += 1
+            continue
         print(f"── cue {cue}  ({len(inst_files)} instrument(s): {', '.join(inst_list)})")
 
         loaded = []
@@ -913,8 +958,8 @@ def _cue_sort(c: str):
 def phase_status(args):
     state = load_state()
 
-    raw_groups     = group_raw_xmls(RAW_DIR)
-    merged_groups  = group_merged_mxls(MERGED_DIR)
+    raw_groups    = group_raw_xmls(RAW_DIR)
+    merged_groups = group_merged_mxls(MERGED_DIR)
 
     merged_set: set = set()
     for (cue, _), inst_files in merged_groups.items():
@@ -928,6 +973,7 @@ def phase_status(args):
             if parsed:
                 assembled_cues.add(parsed[0])
 
+    # Always show all 44 defined cues; add any extra from actual data
     all_cues: set = set(CUE_TEMPOS.keys())
     for inst, cue, title in raw_groups:
         all_cues.add(cue)
@@ -940,28 +986,32 @@ def phase_status(args):
         sorted_cues = [c for c in sorted_cues if c == args.cue.upper()]
 
     def cell(inst: str, cue: str) -> str:
+        """Return display value for one (instrument, cue) cell."""
         if (inst, cue) in merged_set and cue in assembled_cues:
-            return "done"
+            return "DONE"
         if (inst, cue) in merged_set:
-            return "merged"
+            return "MERGED"
         raw_parts = [
-            (p, s)
-            for (i, c, _t), parts in raw_groups.items()
+            s for (i, c, _t), parts in raw_groups.items()
             if i == inst and c == cue
-            for p, s in parts
+            for _p, s in parts
         ]
         if raw_parts:
             complete = state.get(f"{inst}.{cue}", {}).get("complete", False)
-            return "ready" if complete else f"raw({len(raw_parts)})"
-        return "·"
+            if complete:
+                return f"READY({len(raw_parts)})"
+            return f"PARTIAL({len(raw_parts)})"
+        return "—"
 
-    # Pre-compute table
+    def full_cell(cue: str) -> str:
+        return "DONE" if cue in assembled_cues else "—"
+
+    # Pre-compute
     table = {(inst, cue): cell(inst, cue) for cue in sorted_cues for inst in INSTRUMENTS}
 
-    # Print
-    abbrevs = ["bass", "cello", "gtr1", "gtr2", "perc", "viola", "violin", "piano"]
+    abbrevs = ["bass", "cello", "gtr1", "gtr2", "perc", "viola", "violin", "piano", "Full"]
     cue_w   = 6
-    col_w   = 8
+    col_w   = 11   # wide enough for PARTIAL(N)
 
     header = f"  {'Cue':<{cue_w}}" + "".join(f"  {a:<{col_w}}" for a in abbrevs)
     sep    = "  " + "─" * (len(header) - 2)
@@ -970,21 +1020,26 @@ def phase_status(args):
     print(sep)
 
     for cue in sorted_cues:
-        cells = [table[(inst, cue)] for inst in INSTRUMENTS]
-        if all(c == "·" for c in cells):
-            continue
+        cells = [table[(inst, cue)] for inst in INSTRUMENTS] + [full_cell(cue)]
         print(f"  {cue:<{cue_w}}" + "".join(f"  {c:<{col_w}}" for c in cells))
 
+    # Totals row: count of MERGED+DONE per instrument column
+    print(sep)
+    totals = []
+    for inst in INSTRUMENTS:
+        n = sum(1 for cue in sorted_cues
+                if table[(inst, cue)] in ("MERGED", "DONE"))
+        totals.append(str(n))
+    totals.append(str(len(assembled_cues)))   # Full column
+    print(f"  {'':>{cue_w}}" + "".join(f"  {t:<{col_w}}" for t in totals))
     print(sep)
 
-    counts = {v: sum(1 for v2 in table.values() if v2 == v)
-              for v in ("done", "merged", "ready")}
-    raw_n  = sum(1 for v in table.values() if v.startswith("raw("))
-
-    print(
-        f"\n  raw: {raw_n}  ready: {counts['ready']}  "
-        f"merged: {counts['merged']}  done: {counts['done']}"
+    complete_cells = sum(
+        1 for v in table.values() if v in ("MERGED", "DONE")
     )
+    total_cells = len(INSTRUMENTS) * len(CUE_TEMPOS)
+    print(f"\n  {complete_cells}/{total_cells} instrument-cues complete "
+          f"({len(CUE_TEMPOS)} cues × {len(INSTRUMENTS)} instruments)")
     print(f"  Dirs: raw={RAW_DIR}")
     print(f"        merged={MERGED_DIR}")
     print(f"        assembled={ASSEMBLED_DIR}")
