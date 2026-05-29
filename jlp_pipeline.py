@@ -108,10 +108,9 @@ def parse_xml_name(path: Path):
     if inst not in INSTRUMENTS:
         return None
     cue = parts[2].upper()
-    # Last part is a suffix if it's a single lowercase letter >= 'b'
+    # Last part is a suffix if it's an all-lowercase string >= 'b'
     if (
         len(parts) >= 5
-        and len(parts[-1]) == 1
         and parts[-1].islower()
         and parts[-1] >= "b"
     ):
@@ -218,15 +217,26 @@ def suffix_sort_key(suffix) -> int:
 
 
 def next_suffix(suffix) -> str:
-    """None → 'b', 'b' → 'c', 'c' → 'd', ..."""
-    return "b" if suffix is None else chr(ord(suffix) + 1)
+    """None → 'b', 'b' → 'c', ..., 'z' → 'ba', 'ba' → 'bb', ..."""
+    if suffix is None:
+        return "b"
+    # Single letter: increment; wrap at 'z' by extending to two-letter suffix
+    if len(suffix) == 1:
+        if suffix < "z":
+            return chr(ord(suffix) + 1)
+        return "ba"
+    # Two-letter suffix: increment last character, carry if needed
+    head, last = suffix[:-1], suffix[-1]
+    if last < "z":
+        return head + chr(ord(last) + 1)
+    return head + "a"  # unlikely to ever hit this depth
 
 
 def _parse_chunk_pdf_name(path: Path):
     """
     Parse a chunk PDF created by this script: JLP.{inst}.{cue}.{title}.{suffix}.pdf
     Returns (inst, cue, title, suffix) or None.
-    suffix is a single lowercase letter >= 'b' (first chunk is .b, second .c, ...).
+    suffix is a lowercase string >= 'b' (b, c, ..., z, ba, bb, ...).
     """
     if path.suffix.lower() != ".pdf":
         return None
@@ -239,7 +249,7 @@ def _parse_chunk_pdf_name(path: Path):
         return None
     cue  = parts[2].upper()
     last = parts[-1]
-    if not (len(last) == 1 and last.islower() and last >= "b"):
+    if not (last.islower() and last >= "b"):
         return None
     return inst, cue, ".".join(parts[3:-1]), last
 
@@ -751,8 +761,8 @@ def extract_pages_fixed(src_path: Path, from_page_0: int, output_path: Path) -> 
     """
     Extract pages [from_page_0 .. end] to output_path, skipping navigation/
     marker-only pages (V.S. indicators, blank spacer pages, etc.).
-    Pages with /Rotate metadata are re-rendered so PlayScore receives upright
-    pages with no rotation flag.
+    Pages with rotation==180 are corrected via PIL so PlayScore doesn't silently
+    re-read page 1 when it encounters an upside-down page.
     Returns the number of music pages written (0 if only nav pages remained).
     """
     src   = fitz.open(str(src_path))
@@ -764,15 +774,23 @@ def extract_pages_fixed(src_path: Path, from_page_0: int, output_path: Path) -> 
         if _is_navigation_page(src_page):
             print(f"   (skipping navigation/marker page {idx + 1}/{total})")
             continue
-        if src_page.rotation == 0:
-            out.insert_pdf(src, from_page=idx, to_page=idx)
+        if src_page.rotation == 180:
+            # Extract the raw embedded image, rotate 180° with PIL, and write a
+            # fresh page so PlayScore receives a clean upright image with no
+            # rotation metadata.
+            images = src_page.get_images()
+            xref   = images[0][0]
+            pix    = fitz.Pixmap(src, xref)
+            img    = Image.open(io.BytesIO(pix.tobytes("png")))
+            img    = img.rotate(180)
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format="PNG")
+            rotated_pix = fitz.Pixmap(img_bytes.getvalue())
+            new_page = out.new_page(width=src_page.rect.width,
+                                    height=src_page.rect.height)
+            new_page.insert_image(new_page.rect, pixmap=rotated_pix)
         else:
-            # fitz.get_pixmap auto-corrects /Rotate → bake result into plain image page
-            mat     = fitz.Matrix(2.0, 2.0)   # render at 2× for quality
-            pix     = src_page.get_pixmap(matrix=mat)
-            w, h    = pix.width / 2.0, pix.height / 2.0
-            new_pg  = out.new_page(width=w, height=h)
-            new_pg.insert_image(fitz.Rect(0, 0, w, h), pixmap=pix)
+            out.insert_pdf(src, from_page=idx, to_page=idx)
 
     n_written = len(out)
     if n_written > 0:
