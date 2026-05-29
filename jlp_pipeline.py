@@ -739,9 +739,9 @@ def phase_check(args):
         print("Drop your PlayScore XML exports there and re-run.")
         return
 
-    state            = load_state()
-    complete_count   = 0
-    incomplete_count = 0
+    state           = load_state()
+    complete_entries: list = []   # "inst cue XX" for complete instruments
+    chunk_pdfs:      list = []    # Path objects for generated chunk PDFs
 
     print(f"\nFound {len(groups)} instrument/cue group(s) in {RAW_DIR}\n")
 
@@ -754,7 +754,6 @@ def phase_check(args):
         except ValueError as exc:
             print(f"   [error] {exc}")
             print()
-            incomplete_count += 1
             continue
 
         print(f"   Latest : {latest_path.name}  (last measure: m{last_m})")
@@ -767,7 +766,6 @@ def phase_check(args):
             print(f"   [warning] Source PDF not found.")
             print(f"   Expected: {SOURCE_DIR}/{inst}/JLP.{inst}.{cue}.{title}.pdf")
             print()
-            incomplete_count += 1
             continue
         print(f"   Source PDF : {pdf_path.name}")
 
@@ -814,7 +812,7 @@ def phase_check(args):
             cached["complete"]     = True
             cached["last_measure"] = last_m
             save_state(state)
-            complete_count += 1
+            complete_entries.append(f"{inst} cue {cue}")
             print()
             continue
 
@@ -840,7 +838,7 @@ def phase_check(args):
                     cached["complete"]     = True
                     cached["last_measure"] = last_m
                     save_state(state)
-                    complete_count += 1
+                    complete_entries.append(f"{inst} cue {cue}")
                     print()
                     continue
                 # Single-page fallback: if there is only one page there is nowhere
@@ -852,12 +850,11 @@ def phase_check(args):
                     cached["complete"]     = True
                     cached["last_measure"] = last_m
                     save_state(state)
-                    complete_count += 1
+                    complete_entries.append(f"{inst} cue {cue}")
                     print()
                     continue
                 print(f"   [warning] Could not locate m{last_m} in {pdf_path.name}.")
                 print()
-                incomplete_count += 1
                 continue
             cached["last_measure"]        = last_m
             cached["last_measure_page_0"] = page_0
@@ -873,7 +870,7 @@ def phase_check(args):
             cached["complete"]     = True
             cached["last_measure"] = last_m
             save_state(state)
-            complete_count += 1
+            complete_entries.append(f"{inst} cue {cue}")
             print()
             continue
 
@@ -887,16 +884,35 @@ def phase_check(args):
         ps_name = chunk_path.stem.replace(".", "") + ".xml"
         print(f"   → Chunk PDF : {chunk_path.name}")
         print(f"      Pages {page_0 + 2}–{total_pages} ({n_pages} page(s))")
-        print(f"   → Import that PDF into PlayScore and export the XML.")
-        print(f"      PlayScore will name it: {ps_name}")
-        print(f"      Drop it in: {RAW_DIR}")
-        print(f"      (Any name PlayScore gives is fine — script matches by instrument+cue)")
-        incomplete_count += 1
+        print(f"      PlayScore will name the export: {ps_name}")
+        chunk_pdfs.append(chunk_path)
         print()
 
-    print(f"Summary: {complete_count} complete, {incomplete_count} incomplete")
-    if complete_count:
-        print("Run --phase merge to process complete groups.")
+    # ── Actionable summary ────────────────────────────────────────────────────
+    print()
+    if chunk_pdfs and complete_entries:
+        # Mixed: some need more work, some are ready
+        print("═══ ACTION REQUIRED ═══")
+        print("Import these PDFs into PlayScore and export XMLs to the raw folder:")
+        for i, cp in enumerate(chunk_pdfs, 1):
+            print(f"  {i}. {cp.name}  →  {cp.parent}")
+        print(f"When done, re-run: python3 jlp_pipeline.py --phase check")
+        print()
+        print("═══ READY TO MERGE ═══")
+        print("The following are complete and ready to merge:")
+        print("  " + ", ".join(complete_entries))
+        print("Run: python3 jlp_pipeline.py --phase merge")
+    elif chunk_pdfs:
+        # Nothing complete yet — only action items
+        print("═══ ACTION REQUIRED ═══")
+        print("Import these PDFs into PlayScore and export XMLs to the raw folder:")
+        for i, cp in enumerate(chunk_pdfs, 1):
+            print(f"  {i}. {cp.name}  →  {cp.parent}")
+        print(f"When done, re-run: python3 jlp_pipeline.py --phase check")
+    elif complete_entries:
+        # Everything that could be checked is complete
+        print("═══ ALL COMPLETE ═══")
+        print("All exports done. Run: python3 jlp_pipeline.py --phase merge")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
