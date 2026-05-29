@@ -222,6 +222,28 @@ def next_suffix(suffix) -> str:
     return "b" if suffix is None else chr(ord(suffix) + 1)
 
 
+def _parse_chunk_pdf_name(path: Path):
+    """
+    Parse a chunk PDF created by this script: JLP.{inst}.{cue}.{title}.{suffix}.pdf
+    Returns (inst, cue, title, suffix) or None.
+    suffix is a single lowercase letter >= 'b' (first chunk is .b, second .c, ...).
+    """
+    if path.suffix.lower() != ".pdf":
+        return None
+    stem  = path.stem
+    parts = stem.split(".")
+    if len(parts) < 5 or parts[0].upper() != "JLP":
+        return None
+    inst = parts[1].lower()
+    if inst not in INSTRUMENTS:
+        return None
+    cue  = parts[2].upper()
+    last = parts[-1]
+    if not (len(last) == 1 and last.islower() and last >= "b"):
+        return None
+    return inst, cue, ".".join(parts[3:-1]), last
+
+
 def group_raw_xmls(raw_dir: Path, filter_inst=None, filter_cue=None) -> dict:
     """
     Scan raw_dir for XML exports, group by (inst, cue, canonical_title).
@@ -818,6 +840,27 @@ def phase_check(args):
         save_overrides(overrides)
         save_state(state)
 
+    # ── Startup: archive chunk PDFs already imported into PlayScore ──────────
+    # Match every PDF in next_pdfs/ against XMLs in raw/ by (inst, cue, suffix).
+    # If a match is found the user has already imported that PDF, so move it to
+    # trash/ to keep next_pdfs/ clean.
+    if NEXT_DIR.exists():
+        all_raw = group_raw_xmls(RAW_DIR)
+        imported_sigs: set = set()
+        for (i, c, _t), parts in all_raw.items():
+            for _p, suf in parts:
+                if suf is not None:
+                    imported_sigs.add((i, c, suf))
+        TRASH_DIR.mkdir(parents=True, exist_ok=True)
+        for f in sorted(NEXT_DIR.iterdir()):
+            parsed = _parse_chunk_pdf_name(f)
+            if parsed is None:
+                continue
+            p_inst, p_cue, _p_title, p_suf = parsed
+            if (p_inst, p_cue, p_suf) in imported_sigs:
+                shutil.move(str(f), str(TRASH_DIR / f.name))
+                print(f"Archived to trash/: {f.name}  (XML already in raw/)")
+
     groups = group_raw_xmls(RAW_DIR, filter_inst=args.instrument, filter_cue=args.cue)
 
     if not groups:
@@ -1042,6 +1085,14 @@ def phase_check(args):
     elif complete_entries:
         print("═══ ALL COMPLETE ═══")
         print("All exports done. Run: python3 jlp_pipeline.py --phase merge")
+
+    # ── Directory counts ──────────────────────────────────────────────────────
+    n_next  = sum(1 for f in NEXT_DIR.iterdir()  if f.suffix.lower() == ".pdf") \
+              if NEXT_DIR.exists() else 0
+    n_trash = sum(1 for f in TRASH_DIR.rglob("*") if f.is_file()) \
+              if TRASH_DIR.exists() else 0
+    print(f"\nnext_pdfs/: {n_next} PDF(s) waiting to be imported")
+    print(f"trash/:     {n_trash} file(s) archived")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
