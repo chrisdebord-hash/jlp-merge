@@ -1,6 +1,6 @@
 # JLP Toolkit
 
-Three scripts for the JLP pit-orchestra MusicXML pipeline: PlayScore exports → merged MXL → Logic Pro multi-track session.
+Single-entry pipeline (`jlp_pipeline.py`) plus legacy per-operation scripts for the JLP pit-orchestra MusicXML workflow: PlayScore exports → merged MXL → Logic Pro multi-track session.
 
 ## Install
 
@@ -70,7 +70,7 @@ What it does:
   and injects MIDI program-change directions
 - Injects cue tempo at m1 from the built-in table if the source lacks one
 - Flags measures with unresolved durations (`type=?`) as warnings
-- Writes a compressed `.mxl` file to `~/JLP_exports/`
+- Writes a compressed `.mxl` file to the exports directory
 
 #### Assemble mode — combine per-instrument MXLs into a full score
 
@@ -123,15 +123,28 @@ Highlights anything that has a source PDF but no merged MXL yet.
 
 ---
 
-## File conventions
+## Directory layout
 
-| File | Location |
-|------|----------|
-| Source PDFs | `~/Google Drive/My Drive/JLP/{instrument}/JLP.{inst}.{cue}.{title}.pdf` |
-| PlayScore XML exports | anywhere; typically `{inst}_{cue}_part1.xml` |
-| Per-instrument MXL | `~/JLP_exports/JLP.{instrument}.{cue}.mxl` |
-| Full score MXL | `~/JLP_exports/JLP.{cue}.full.mxl` |
-| Next-chunk PDFs | current directory (drag into PlayScore) |
+| Location | Purpose |
+|----------|---------|
+| `/Users/chrisdebord/Google Drive/My Drive/JLP/{instrument}/` | Source PDFs (read-only) |
+| `.../JLP/exports/raw/` | Drop PlayScore XML exports here |
+| `.../JLP/exports/next_pdfs/` | Script writes next-chunk PDFs here |
+| `.../JLP/exports/merged/` | Per-instrument merged MXLs |
+| `.../JLP/exports/assembled/` | Full-score MXLs per cue |
+| `.../JLP/exports/ready/` | Final Logic-ready MXLs |
+
+**File naming convention:**
+
+| File | Pattern |
+|------|---------|
+| Source PDF | `JLP.{inst}.{cue}.{title}.pdf` |
+| First PlayScore export | `JLP.{inst}.{cue}.{title}.xml` |
+| Second export (if needed) | `JLP.{inst}.{cue}.{title}.b.xml` |
+| Third export | `JLP.{inst}.{cue}.{title}.c.xml` |
+| Next-chunk PDF (auto-generated) | `JLP.{inst}.{cue}.{title}.b.pdf` |
+| Merged per-instrument MXL | `JLP.{inst}.{cue}.{title}.mxl` |
+| Full score MXL | `JLP.{cue}.{title}.full.mxl` |
 
 ---
 

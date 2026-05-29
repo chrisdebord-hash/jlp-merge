@@ -9,7 +9,7 @@ from pathlib import Path
 SOURCE_DIR = Path("/Users/chrisdebord/Google Drive/My Drive/JLP")
 
 # ─── Working directories ─────────────────────────────────────────────────────
-EXPORTS_DIR   = Path.home() / "JLP_exports"
+EXPORTS_DIR   = Path("/Users/chrisdebord/Google Drive/My Drive/JLP/exports")
 RAW_DIR       = EXPORTS_DIR / "raw"          # user drops XMLs here
 NEXT_DIR      = EXPORTS_DIR / "next_pdfs"    # script writes chunk PDFs here
 MERGED_DIR    = EXPORTS_DIR / "merged"       # per-instrument merged MXLs
