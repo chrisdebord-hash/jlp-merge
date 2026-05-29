@@ -109,6 +109,59 @@ def parse_xml_name(path: Path):
     return inst, cue, title, suffix
 
 
+def parse_playscorename(path: Path):
+    """
+    Parse PlayScore-style filenames where dots are stripped on save.
+
+    PlayScore imports a PDF named JLP.bass.00.OVERTURE.pdf and exports the
+    XML with all dots removed from the base name:
+      JLPbass00OVERTURE.xml       → ("bass", "00", "OVERTURE", None)
+      JLPbass00OVERTUREb.xml      → ("bass", "00", "OVERTURE", "b")
+      JLPguitar100OVERTURE.xml    → ("guitar1", "00", "OVERTURE", None)
+      JLPpercussion00OVERTURE.xml → ("percussion", "00", "OVERTURE", None)
+
+    Returns (instrument, cue, raw_title, suffix) or None.
+    Suffix: single lowercase letter >= 'b' appended after the title.
+    """
+    if path.suffix.lower() != ".xml":
+        return None
+    stem = path.stem   # e.g. "JLPbass00OVERTURE"
+
+    if not stem.upper().startswith("JLP"):
+        return None
+    rest = stem[3:]    # strip leading "JLP"
+
+    # Match instrument — longest first to avoid "guitar" matching before "guitar1"
+    inst = None
+    for candidate in sorted(INSTRUMENTS, key=len, reverse=True):
+        if rest.lower().startswith(candidate.lower()):
+            inst = candidate
+            rest = rest[len(candidate):]
+            break
+    if inst is None:
+        return None
+
+    # Match cue — longest first so "01A" is tried before "01"
+    cue = None
+    for candidate in sorted(CUE_TEMPOS.keys(), key=len, reverse=True):
+        if rest.upper().startswith(candidate.upper()):
+            cue = candidate
+            rest = rest[len(candidate):]
+            break
+    if cue is None:
+        return None
+
+    # Suffix: single lowercase letter >= 'b' at end (title itself is uppercase)
+    if rest and rest[-1].islower() and rest[-1] >= "b":
+        suffix    = rest[-1]
+        raw_title = rest[:-1]
+    else:
+        suffix    = None
+        raw_title = rest
+
+    return inst, cue, raw_title, suffix
+
+
 def parse_merged_name(path: Path):
     """
     Parse JLP.{instrument}.{cue}.{title}.mxl
@@ -157,22 +210,48 @@ def next_suffix(suffix) -> str:
 
 def group_raw_xmls(raw_dir: Path, filter_inst=None, filter_cue=None) -> dict:
     """
-    Scan raw_dir for JLP-named XMLs, group by (inst, cue, title).
+    Scan raw_dir for XML exports, group by (inst, cue, canonical_title).
+
+    Accepts both naming conventions:
+    - Standard JLP:  JLP.bass.00.OVERTURE.xml  (dots preserved)
+    - PlayScore:     JLPbass00OVERTURE.xml      (dots stripped by PlayScore on save)
+
+    For PlayScore names the canonical title is resolved from the matching source
+    PDF so all downstream naming uses the correct base name.
+
     Returns {(inst, cue, title): [(path, suffix), ...]} sorted by suffix.
     """
     groups: dict = {}
     if not raw_dir.exists():
         return groups
     for f in sorted(raw_dir.iterdir()):
-        parsed = parse_xml_name(f)
-        if parsed is None:
+        if f.suffix.lower() != ".xml":
             continue
-        inst, cue, title, suffix = parsed
+
+        # Try standard JLP naming first
+        parsed = parse_xml_name(f)
+        if parsed is not None:
+            inst, cue, title, suffix = parsed
+        else:
+            # Try PlayScore naming (dots stripped)
+            parsed = parse_playscorename(f)
+            if parsed is None:
+                continue
+            inst, cue, raw_title, suffix = parsed
+            # Resolve canonical title from the source PDF for this inst+cue
+            pdf = _find_source_pdf(inst, cue, raw_title)
+            if pdf is not None:
+                pdf_parts = pdf.stem.split(".")
+                title = ".".join(pdf_parts[3:]) if len(pdf_parts) > 3 else raw_title
+            else:
+                title = raw_title
+
         if filter_inst and inst != filter_inst:
             continue
         if filter_cue and cue != filter_cue.upper():
             continue
         groups.setdefault((inst, cue, title), []).append((f, suffix))
+
     for key in groups:
         groups[key].sort(key=lambda x: suffix_sort_key(x[1]))
     return groups
@@ -727,18 +806,32 @@ def phase_check(args):
             cached["complete"]            = False
             save_state(state)
 
+        # If the cutoff page is the last page, nothing remains — mark complete.
+        # (Happens when last-page OCR returns a number slightly above last_m due to
+        # other numbers visible on the page, but the XML actually covers everything.)
+        if page_0 + 1 >= total_pages:
+            print(f"   ✓ Complete — m{last_m} is on the last page. Ready to merge.")
+            cached["complete"]     = True
+            cached["last_measure"] = last_m
+            save_state(state)
+            complete_count += 1
+            print()
+            continue
+
         # Extract remaining pages after the cutoff page
         next_suf   = next_suffix(latest_suffix)
         chunk_name = f"JLP.{inst}.{cue}.{title}.{next_suf}.pdf"
         chunk_path = NEXT_DIR / chunk_name
         n_pages    = extract_pages_fixed(pdf_path, page_0 + 1, chunk_path)
 
-        next_xml = f"JLP.{inst}.{cue}.{title}.{next_suf}.xml"
+        # PlayScore strips dots when naming the XML after the imported PDF
+        ps_name = chunk_path.stem.replace(".", "") + ".xml"
         print(f"   → Chunk PDF : {chunk_path.name}")
         print(f"      Pages {page_0 + 2}–{total_pages} ({n_pages} page(s))")
-        print(f"   → Save your next PlayScore export as:")
-        print(f"        {next_xml}")
+        print(f"   → Import that PDF into PlayScore and export the XML.")
+        print(f"      PlayScore will name it: {ps_name}")
         print(f"      Drop it in: {RAW_DIR}")
+        print(f"      (Any name PlayScore gives is fine — script matches by instrument+cue)")
         incomplete_count += 1
         print()
 
