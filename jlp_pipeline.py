@@ -1074,6 +1074,14 @@ def phase_check(args):
                 shutil.move(str(consumed_pdf), str(TRASH_DIR / consumed_name))
                 print(f"   Moved to trash/: {consumed_name}")
 
+        # Move all older XMLs for this inst+cue to trash/ — only the latest
+        # part should remain in raw/ for the next PlayScore import cycle.
+        TRASH_DIR.mkdir(parents=True, exist_ok=True)
+        for old_path, _ in parts[:-1]:
+            if old_path.exists():
+                shutil.move(str(old_path), str(TRASH_DIR / old_path.name))
+                print(f"   Moved to trash/: {old_path.name}")
+
         cached["last_generated_for_xml"] = latest_path.name
         save_state(state)
 
