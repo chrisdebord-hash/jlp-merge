@@ -265,7 +265,11 @@ def group_raw_xmls(raw_dir: Path, filter_inst=None, filter_cue=None) -> dict:
     For PlayScore names the canonical title is resolved from the matching source
     PDF so all downstream naming uses the correct base name.
 
-    Returns {(inst, cue, title): [(path, suffix), ...]} sorted by suffix.
+    Returns {(inst, cue, title): [(path, suffix), ...]} sorted by modification
+    time ascending (oldest first, most recent last).  Sorting by mtime rather
+    than suffix order ensures iCloud ghost entries (stale directory listings for
+    files that have already been moved) are always treated as older than the real
+    current file.
     """
     groups: dict = {}
     if not raw_dir.exists():
@@ -291,6 +295,17 @@ def group_raw_xmls(raw_dir: Path, filter_inst=None, filter_cue=None) -> dict:
                 title = ".".join(pdf_parts[3:]) if len(pdf_parts) > 3 else raw_title
             else:
                 title = raw_title
+            # Correct suffix against the canonical title.  parse_playscorename
+            # strips a single trailing lowercase char as a potential suffix, but
+            # titles can end with lowercase letters (e.g. "You" → raw="Yo" suf="u").
+            # Case 1: title == raw_title + suffix  →  the char was part of the title
+            # Case 2: raw_title starts with title  →  multi-char suffix was absorbed
+            if raw_title != title:
+                if title == raw_title + (suffix or ""):
+                    suffix = None
+                elif raw_title.startswith(title):
+                    extra  = raw_title[len(title):]
+                    suffix = extra if (extra.islower() and extra >= "b") else None
 
         if filter_inst and inst != filter_inst:
             continue
@@ -299,7 +314,7 @@ def group_raw_xmls(raw_dir: Path, filter_inst=None, filter_cue=None) -> dict:
         groups.setdefault((inst, cue, title), []).append((f, suffix))
 
     for key in groups:
-        groups[key].sort(key=lambda x: suffix_sort_key(x[1]))
+        groups[key].sort(key=lambda x: x[0].stat().st_mtime)
     return groups
 
 
@@ -904,8 +919,11 @@ def phase_check(args):
 
         print(f"   Latest : {latest_path.name}  (last measure: m{last_m})")
 
-        state_key = f"{inst}.{cue}"
-        cached    = state.setdefault(state_key, {})
+        state_key    = f"{inst}.{cue}"
+        cached       = state.setdefault(state_key, {})
+        prev_seen    = cached.get("last_seen_xml")
+        cached["last_seen_xml"] = latest_path.name
+        save_state(state)
 
         # Check manual override
         if state_key in overrides:
@@ -1034,10 +1052,9 @@ def phase_check(args):
             continue
 
         # ── Step 4: Loop detection ────────────────────────────────────────────
-        # Trigger only when the SAME XML file was already seen last run — not
-        # when a new XML happens to end on the same measure number as a cached
-        # value from a different session or a different part file.
-        if cached.get("last_generated_for_xml") == latest_path.name:
+        # Trigger only when the same XML filename was seen in the previous run,
+        # meaning no new export was produced between runs.
+        if prev_seen == latest_path.name:
             print(
                 f"\n[warning] {inst} cue {cue}: PlayScore has exported m{last_m} twice "
                 f"in a row from the same pages. PlayScore may have hit its recognition "
@@ -1081,9 +1098,6 @@ def phase_check(args):
             if old_path.exists():
                 shutil.move(str(old_path), str(TRASH_DIR / old_path.name))
                 print(f"   Moved to trash/: {old_path.name}")
-
-        cached["last_generated_for_xml"] = latest_path.name
-        save_state(state)
 
         ps_name = chunk_path.stem.replace(".", "") + ".xml"
         print(f"   → Chunk PDF : {chunk_path.name}")
