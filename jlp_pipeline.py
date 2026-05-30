@@ -32,8 +32,8 @@ from statistics import median as _median
 from jlp_common import (
     SOURCE_DIR, EXPORTS_DIR, RAW_DIR, NEXT_DIR,
     MERGED_DIR, ASSEMBLED_DIR, TRASH_DIR, TRASH_MERGED_DIR,
-    STATE_FILE, OVERRIDES_FILE, ALL_DIRS, INSTRUMENTS,
-    CUE_TEMPOS, GM_DEFAULT,
+    STATE_FILE, OVERRIDES_FILE, PUNCHLIST_FILE, TOTALS_FILE, ANSWERS_FILE,
+    ALL_DIRS, INSTRUMENTS, CUE_TEMPOS, GM_DEFAULT,
 )
 
 try:
@@ -367,6 +367,116 @@ def load_overrides() -> set:
 def save_overrides(overrides: set):
     OVERRIDES_FILE.parent.mkdir(parents=True, exist_ok=True)
     OVERRIDES_FILE.write_text(json.dumps(sorted(overrides), indent=2))
+
+
+def load_punchlist() -> dict:
+    if PUNCHLIST_FILE.exists():
+        try:
+            return json.loads(PUNCHLIST_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_punchlist(punchlist: dict):
+    PUNCHLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PUNCHLIST_FILE.write_text(json.dumps(punchlist, indent=2))
+
+
+def load_totals() -> dict:
+    if TOTALS_FILE.exists():
+        try:
+            return json.loads(TOTALS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_totals(totals: dict):
+    TOTALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOTALS_FILE.write_text(json.dumps(totals, indent=2))
+
+
+def load_answers() -> dict:
+    if ANSWERS_FILE.exists():
+        try:
+            return json.loads(ANSWERS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_answers(answers: dict):
+    ANSWERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ANSWERS_FILE.write_text(json.dumps(answers, indent=2))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Interactive clarification
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_question_box(context: str, description: list, question: str, hint: str) -> str:
+    """
+    Render the question box to stdout, collect user input, and return it.
+    description: list of body strings (empty string = blank separator line).
+    Returns the raw stripped input string (possibly empty if user pressed Enter).
+    """
+    header = f"QUESTION NEEDED — {context}"
+    body   = [header, ""] + description + ["", question]
+    if hint:
+        body.append(f"({hint})")
+    body.append("")
+    prompt = "Enter answer (or press Enter to skip)"
+
+    inner_w = max(len(l) for l in body + [prompt + ": "]) + 2  # 1-char padding each side
+    bar     = "─" * inner_w
+
+    print(f"\n  ┌{bar}┐")
+    for line in body:
+        print(f"  │ {line:<{inner_w - 1}}│")
+    # Prompt line — input() puts the cursor right after it; bottom border follows
+    sys.stdout.write(f"  │ {prompt + ': ':<{inner_w - 1}}│\n  └{bar}┘\n  > ")
+    sys.stdout.flush()
+    try:
+        return input().strip()
+    except EOFError:
+        return ""
+
+
+def _ask_question(
+    key:         str,
+    context:     str,
+    description: list,
+    question:    str,
+    hint:        str,
+    answers:     dict,
+    args,
+) -> "str | None":
+    """
+    Return a stored answer for *key* without prompting, or prompt the user and
+    store their answer, or return None when running non-interactively / skipped.
+
+    Never asks the same question twice.  The answer is persisted to
+    .jlp_answers.json immediately after the user responds.
+    """
+    if key in answers:
+        stored = answers[key].get("answer", "")
+        if stored:
+            print(f"   (stored answer for {key!r}: {stored!r})")
+            return stored
+        return None   # previously skipped
+
+    if getattr(args, "no_interactive", False):
+        return None
+
+    if not sys.stdin.isatty():
+        return None
+
+    answer = _render_question_box(context, description, question, hint)
+    # Store regardless of content so we don't ask again on the next run
+    answers[key] = {"answer": answer, "question": question}
+    save_answers(answers)
+    return answer if answer else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -853,6 +963,7 @@ def phase_check(args):
 
     state     = load_state()
     overrides = load_overrides()
+    answers   = load_answers()
 
     # Process --mark-complete flags before scanning
     if args.mark_complete:
@@ -909,27 +1020,20 @@ def phase_check(args):
     for (inst, cue, title), parts in sorted(groups.items()):
         latest_path, latest_suffix = parts[-1]
         print(f"── {inst} / cue {cue}  ({len(parts)} part(s))")
-
-        try:
-            last_m = last_measure_number(latest_path)
-        except ValueError as exc:
-            print(f"   [error] {exc}")
-            print()
-            continue
-
-        print(f"   Latest : {latest_path.name}  (last measure: m{last_m})")
+        print(f"   Latest : {latest_path.name}")
 
         state_key    = f"{inst}.{cue}"
         cached       = state.setdefault(state_key, {})
         prev_seen    = cached.get("last_seen_xml")
+        prev_covered = set(cached.get("covered_pages", []))
+
         cached["last_seen_xml"] = latest_path.name
         save_state(state)
 
         # Check manual override
         if state_key in overrides:
             print(f"   ✓ Complete (manual override). Ready to merge.")
-            cached["complete"]     = True
-            cached["last_measure"] = last_m
+            cached["complete"] = True
             save_state(state)
             complete_entries.append(f"{inst} cue {cue}")
             print()
@@ -943,115 +1047,149 @@ def phase_check(args):
             continue
         print(f"   Source PDF : {pdf_path.name}")
 
-        # ── Step 1: OCR last page to get total measure count (cheap, cached) ───
-        last_score_m = None
+        # ── Step 1: Get total pages (no OCR needed) ──────────────────────────
         if (
             not args.force
             and cached.get("pdf_path") == str(pdf_path)
-            and "last_score_measure" in cached
+            and "total_pages" in cached
         ):
-            last_score_m = cached["last_score_measure"]
-            # Retroactively cap if cached before cap logic was added
-            if inst in _SINGLE_STAFF and last_score_m > 300:
-                total_pages_est = cached.get("total_pages", 1)
-                fallback = total_pages_est * 30
-                print(f"   [warning] Cached score total {last_score_m} > 300 — OCR error; "
-                      f"using page estimate {fallback} ({total_pages_est} pages × 30)")
-                last_score_m = fallback
-                cached["last_score_measure"] = last_score_m
-                save_state(state)
-            else:
-                print(f"   (cached) score total: ~m{last_score_m}")
+            total_pages = cached["total_pages"]
         else:
             doc = fitz.open(str(pdf_path))
             total_pages = len(doc)
-            score_page_note = ""
-            for back in range(min(3, total_pages)):
-                # Use full-page OCR for earlier pages: high-numbered measures
-                # appear in the middle of the page, not just the bottom strip.
-                candidate = _ocr_page_max_measure(doc[-(back + 1)], full_page=(back > 0))
-                if candidate is not None:
-                    last_score_m = candidate
-                    if back > 0:
-                        score_page_note = (
-                            f" (p.{total_pages - back} — last {back} page(s) blank)"
-                        )
-                    break
             doc.close()
-            if last_score_m is not None:
-                if inst in _SINGLE_STAFF and last_score_m > 300:
-                    fallback = total_pages * 30
-                    print(f"   [warning] OCR score total {last_score_m} > 300 — OCR error; "
-                          f"using page estimate {fallback} ({total_pages} pages × 30)")
-                    last_score_m = fallback
-                print(f"   Score total: ~m{last_score_m} (OCR{score_page_note})")
-                cached["last_score_measure"] = last_score_m
-                cached["pdf_path"]           = str(pdf_path)
-                cached["total_pages"]        = total_pages
-                save_state(state)
-            else:
-                print(f"   [warning] Could not read measure count from last page of "
-                      f"{pdf_path.name} — will scan forward.")
-
-        # ── Step 2: Determine completeness ────────────────────────────────────
-        if last_score_m is not None and last_m >= last_score_m:
-            print(f"   ✓ Complete — m{last_m} >= m{last_score_m} (score total). Ready to merge.")
-            cached["complete"]     = True
-            cached["last_measure"] = last_m
+            cached["pdf_path"]    = str(pdf_path)
+            cached["total_pages"] = total_pages
             save_state(state)
-            complete_entries.append(f"{inst} cue {cue}")
-            print()
-            continue
+        print(f"   Total pages: {total_pages}")
 
-        # ── Step 3: Incomplete — find cutoff page, extract remaining pages ────
-        if (
-            not args.force
-            and cached.get("last_measure") == last_m
-            and "last_measure_page_0" in cached
-        ):
-            page_0      = cached["last_measure_page_0"]
-            total_pages = cached.get("total_pages", cached["last_measure_page_0"] + 1)
-            print(f"   (cached) m{last_m} on page {page_0 + 1}/{total_pages}")
-        else:
-            page_0, total_pages = scan_pdf_for_measure(pdf_path, last_m)
-            if page_0 is None:
-                if last_score_m is not None and last_m >= last_score_m * 0.9:
-                    print(f"   ✓ Complete (OCR fallback) — m{last_m} is within 10% of "
-                          f"score total m{last_score_m}. Ready to merge.")
-                    cached["complete"]     = True
-                    cached["last_measure"] = last_m
-                    save_state(state)
-                    complete_entries.append(f"{inst} cue {cue}")
-                    print()
+        # ── Step 2: Build page coverage for every XML in the group ───────────
+        # For the no-suffix (first) XML: measure numbers printed in the score
+        # match the source PDF, so we can scan for the last measure to find
+        # which page it falls on.  For chunk XMLs, PlayScore renumbers from m1
+        # so measure numbers cannot be used to locate pages in the source PDF —
+        # instead we use the pending_chunk record written when the chunk was
+        # generated, or infer remaining pages when no next chunk PDF is pending.
+
+        cached_parts_by_name = {p["filename"]: p for p in cached.get("parts", [])}
+        new_parts: list = []
+        prev_end  = 0   # highest 1-based source page covered so far
+
+        for xml_path, xml_suffix in parts:   # oldest → newest by mtime
+            fname = xml_path.name
+
+            # Use cache only when pages is non-empty — an empty cached list
+            # means coverage was deferred in a previous run and must be recomputed.
+            if not args.force and fname in cached_parts_by_name:
+                cached_entry = cached_parts_by_name[fname]
+                if cached_entry.get("pages"):
+                    entry     = cached_entry.copy()
+                    xml_pages = entry["pages"]
+                    prev_end  = max(xml_pages)
+                    new_parts.append(entry)
                     continue
-                if total_pages == 1:
-                    print(f"   ✓ Complete (no further pages) — PDF has 1 page; "
-                          f"merging available measures (m{last_m}).")
-                    cached["complete"]     = True
-                    cached["last_measure"] = last_m
-                    save_state(state)
-                    complete_entries.append(f"{inst} cue {cue}")
-                    print()
-                    continue
-                print(f"   [warning] Could not locate m{last_m} in {pdf_path.name}.")
-                print()
+                # pages missing or empty → fall through to recompute
+
+            # Scan source PDF for this XML's last measure.
+            # For the no-suffix XML, PlayScore reads measure numbers from the
+            # printed score, so the scan locates the exact coverage end page.
+            # For suffix XMLs the same applies when PlayScore preserved source
+            # numbering; if it renumbered from m1 the scan returns a page that
+            # is ≤ prev_end, which we treat as a scan failure and fall back to
+            # covering all remaining pages.
+            try:
+                last_m = last_measure_number(xml_path)
+            except ValueError as exc:
+                print(f"   [error] {exc}")
+                fallback_pages = [1] if xml_suffix is None else list(range(prev_end + 1, total_pages + 1))
+                new_parts.append({"filename": fname, "pages": fallback_pages})
+                prev_end = max(fallback_pages) if fallback_pages else prev_end
                 continue
-            cached["last_measure"]        = last_m
-            cached["last_measure_page_0"] = page_0
-            cached["total_pages"]         = total_pages
-            cached["complete"]            = False
-            save_state(state)
 
-        if page_0 + 1 >= total_pages:
-            print(f"   ✓ Complete — m{last_m} is on the last page. Ready to merge.")
-            cached["complete"]     = True
-            cached["last_measure"] = last_m
+            cached_p0 = cached_parts_by_name.get(fname, {}).get("page_0")
+            if cached_p0 is not None and not args.force:
+                page_0 = cached_p0
+                print(f"   (cached) {fname}: last m{last_m} on source page {page_0 + 1}/{total_pages}")
+            else:
+                page_0, _ = scan_pdf_for_measure(pdf_path, last_m)
+
+            if xml_suffix is None:
+                # No-suffix XML always starts at page 1
+                if page_0 is not None:
+                    xml_pages = list(range(1, page_0 + 2))   # [1..page_0+1] in 1-based
+                    prev_end  = page_0 + 1
+                    new_parts.append({"filename": fname, "pages": xml_pages, "page_0": page_0})
+                else:
+                    # Trigger 2: OCR cannot locate the measure — ask user for the
+                    # last measure number on the last page so we can retry the scan.
+                    resolved_p0 = None
+                    q_key = f"{inst}:{cue}:last_measure_page:{total_pages}"
+                    ans = _ask_question(
+                        key=q_key,
+                        context=f"{inst} cue {cue}",
+                        description=[
+                            f"OCR could not locate measure m{last_m} in",
+                            f"{pdf_path.name}",
+                        ],
+                        question=f"What is the last measure number on page {total_pages}"
+                                 f" of {pdf_path.name}?",
+                        hint="Look at the bottom-right of the last staff",
+                        answers=answers,
+                        args=args,
+                    )
+                    if ans and ans.strip().lstrip("-").isdigit():
+                        hint_m     = int(ans.strip())
+                        retry_p0, _ = scan_pdf_for_measure(pdf_path, hint_m)
+                        if retry_p0 is not None:
+                            resolved_p0 = retry_p0
+
+                    if resolved_p0 is not None:
+                        xml_pages = list(range(1, resolved_p0 + 2))
+                        prev_end  = resolved_p0 + 1
+                        new_parts.append({"filename": fname, "pages": xml_pages,
+                                          "page_0": resolved_p0})
+                    else:
+                        print(f"   [warning] Could not locate m{last_m} in source — "
+                              f"assuming page 1 only")
+                        new_parts.append({"filename": fname, "pages": [1]})
+                        prev_end = 1
+            else:
+                # Suffix XML: use the scan result if it lands past where the
+                # previous XML ended; otherwise assume it covers all remaining pages.
+                if page_0 is not None and (page_0 + 1) > prev_end:
+                    xml_pages = list(range(prev_end + 1, page_0 + 2))
+                    prev_end  = page_0 + 1
+                    new_parts.append({"filename": fname, "pages": xml_pages, "page_0": page_0})
+                else:
+                    xml_pages = list(range(prev_end + 1, total_pages + 1))
+                    prev_end  = total_pages
+                    new_parts.append({"filename": fname, "pages": xml_pages})
+
+        # Compute overall coverage and update state
+        covered  = sorted(set(p for e in new_parts for p in e.get("pages", [])))
+        expected = list(range(1, total_pages + 1))
+
+        cached["covered_pages"] = covered
+        cached["parts"]         = new_parts
+        save_state(state)
+
+        # ── Step 3: Completion check ─────────────────────────────────────────
+        if covered == expected:
+            n = len(covered)
+            print(f"   {inst} cue {cue}: pages 1-{total_pages} covered ({n}/{total_pages}) ✓ Complete")
+            print(f"   ✓ Complete. Ready to merge.")
+            cached["complete"] = True
             save_state(state)
             complete_entries.append(f"{inst} cue {cue}")
             print()
             continue
 
-        # ── Step 4: Check for pending chunk / loop detection ─────────────────
+        n_cov = len(covered)
+        print(f"   {inst} cue {cue}: {n_cov}/{total_pages} pages covered — incomplete")
+        cached["complete"] = False
+        save_state(state)
+
+        # ── Step 4: Check for a pending chunk PDF ────────────────────────────
         next_suf   = next_suffix(latest_suffix)
         chunk_name = f"JLP.{inst}.{cue}.{title}.{next_suf}.pdf"
         chunk_path = NEXT_DIR / chunk_name
@@ -1064,11 +1202,66 @@ def phase_check(args):
             print()
             continue
 
-        if prev_seen is not None and prev_seen == latest_path.name:
+        # ── Step 5: Loop detection ───────────────────────────────────────────
+        # Only warn when the SAME latest filename appears in two consecutive runs
+        # AND page coverage has not advanced since last run.
+        coverage_advanced = set(covered) > prev_covered
+        if prev_seen is not None and prev_seen == latest_path.name and not coverage_advanced:
+            try:
+                last_m_loop = last_measure_number(latest_path)
+            except Exception:
+                last_m_loop = "?"
+            pages_str = (f"pages {min(covered)}-{max(covered)}"
+                         if covered else "unknown pages")
+
+            # Trigger 3: ask whether PlayScore captured everything
+            q_loop = f"{inst}:{cue}:loop_confirmed:{latest_path.name}"
+            ans_loop = _ask_question(
+                key=q_loop,
+                context=f"{inst} cue {cue}",
+                description=[
+                    f"PlayScore exported m{last_m_loop} from {pages_str}",
+                    f"twice in a row without advancing page coverage.",
+                ],
+                question=f"Did PlayScore capture all the music? (yes/no)",
+                hint="Check the exported XML against the score; enter 'yes' if complete",
+                answers=answers,
+                args=args,
+            )
+            if ans_loop and ans_loop.strip().lower() in ("yes", "y"):
+                print(f"   ✓ Complete (user confirmed). Ready to merge.")
+                cached["complete"] = True
+                save_state(state)
+                complete_entries.append(f"{inst} cue {cue}")
+                print()
+                continue
+
+            # Trigger 4: ask whether the instrument is TACET in this cue
+            q_tacet = f"{inst}:{cue}:tacet"
+            ans_tacet = _ask_question(
+                key=q_tacet,
+                context=f"{inst} cue {cue}",
+                description=[
+                    f"Page coverage has not advanced for {inst} cue {cue}.",
+                    f"The instrument may be TACET (silent) for this cue.",
+                ],
+                question=f"Does {inst} play in cue {cue}, or is it TACET?",
+                hint="Enter 'tacet' if silent for the whole cue",
+                answers=answers,
+                args=args,
+            )
+            if ans_tacet and "tacet" in ans_tacet.strip().lower():
+                print(f"   ✓ Complete — {inst} is TACET in cue {cue}. Ready to merge.")
+                cached["complete"] = True
+                save_state(state)
+                complete_entries.append(f"{inst} cue {cue}")
+                print()
+                continue
+
             print(
-                f"\n[warning] {inst} cue {cue}: PlayScore has exported m{last_m} twice "
-                f"in a row from the same pages. PlayScore may have hit its recognition "
-                f"limit on this chunk. Options:\n"
+                f"\n[warning] {inst} cue {cue}: PlayScore has exported the same content "
+                f"twice in a row without advancing page coverage. PlayScore may have hit "
+                f"its recognition limit on this chunk. Options:\n"
                 f"   a) Try importing a smaller chunk (1-2 pages at a time)\n"
                 f"   b) Mark as complete if you believe all music is captured: "
                 f"--mark-complete {inst}:{cue}\n"
@@ -1077,19 +1270,46 @@ def phase_check(args):
             print()
             continue
 
-        # ── Step 5: Extract remaining pages ──────────────────────────────────
-        n_pages = extract_pages_fixed(pdf_path, page_0 + 1, chunk_path)
+        # ── Step 6: Determine chunk start page and generate chunk PDF ────────
+        # from_page_0: 0-indexed source page where the new chunk starts.
+        # The latest XML's pages tell us the last covered page (1-based); the
+        # chunk starts at the 0-indexed equivalent of the next 1-based page,
+        # which equals max(latest_pages) in 0-indexed terms.
+        latest_entry = new_parts[-1] if new_parts else {}
+        latest_pages = latest_entry.get("pages", [])
 
-        if n_pages == 0:
-            print(f"   ✓ Complete — remaining pages are navigation markers only. Ready to merge.")
-            cached["complete"]     = True
-            cached["last_measure"] = last_m
+        if latest_pages:
+            from_page_0 = max(latest_pages)   # 1-based last covered = 0-indexed chunk start
+        else:
+            # Safety fallback: scan source for latest XML's last measure
+            try:
+                last_m_fb  = last_measure_number(latest_path)
+                p0_fb, _   = scan_pdf_for_measure(pdf_path, last_m_fb)
+                from_page_0 = (p0_fb + 1) if p0_fb is not None else 1
+            except Exception:
+                from_page_0 = 1
+
+        if from_page_0 >= total_pages:
+            print(f"   ✓ Complete — last covered page is the final source page. Ready to merge.")
+            cached["complete"] = True
             save_state(state)
             complete_entries.append(f"{inst} cue {cue}")
             print()
             continue
 
-        # Move the consumed chunk PDF (the one that produced latest_path) to trash
+        n_pages = extract_pages_fixed(pdf_path, from_page_0, chunk_path)
+
+        if n_pages == 0:
+            print(f"   ✓ Complete — remaining pages are navigation markers only. Ready to merge.")
+            cached["complete"] = True
+            save_state(state)
+            complete_entries.append(f"{inst} cue {cue}")
+            print()
+            continue
+
+        # Move the consumed chunk PDF (the one that produced latest_path) to trash.
+        # XMLs are NOT moved here — all parts stay in raw/ until --phase merge
+        # runs so that every XML can contribute to page coverage on re-checks.
         if latest_suffix is not None:
             consumed_name = f"JLP.{inst}.{cue}.{title}.{latest_suffix}.pdf"
             consumed_pdf  = NEXT_DIR / consumed_name
@@ -1098,17 +1318,19 @@ def phase_check(args):
                 shutil.move(str(consumed_pdf), str(TRASH_DIR / consumed_name))
                 print(f"   Moved to trash/: {consumed_name}")
 
-        # Move all older XMLs for this inst+cue to trash/ — only the latest
-        # part should remain in raw/ for the next PlayScore import cycle.
-        TRASH_DIR.mkdir(parents=True, exist_ok=True)
-        for old_path, _ in parts[:-1]:
-            if old_path.exists():
-                shutil.move(str(old_path), str(TRASH_DIR / old_path.name))
-                print(f"   Moved to trash/: {old_path.name}")
+        # Record which source pages this new chunk covers so that when the
+        # corresponding XML arrives we can mark those pages as covered.
+        chunk_pages = list(range(from_page_0 + 1, total_pages + 1))
+        cached["pending_chunk"] = {
+            "suffix":   next_suf,
+            "pages":    chunk_pages,
+            "pdf_name": chunk_name,
+        }
+        save_state(state)
 
         ps_name = chunk_path.stem.replace(".", "") + ".xml"
         print(f"   → Chunk PDF : {chunk_path.name}")
-        print(f"      Pages {page_0 + 2}–{total_pages} ({n_pages} page(s))")
+        print(f"      Pages {from_page_0 + 1}–{total_pages} ({n_pages} page(s))")
         print(f"      PlayScore will name the export: {ps_name}")
         chunk_pdfs.append(chunk_path)
         print()
@@ -1146,11 +1368,149 @@ def phase_check(args):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Master measure-count detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _piano_export_total(cue: str) -> "int | None":
+    """
+    Count measures from the merged piano MXL (if it exists) or from complete
+    raw piano XMLs.  Returns None when no piano data is available yet.
+    """
+    # Prefer the merged MXL — scan MERGED_DIR for any file matching the cue
+    if MERGED_DIR.exists():
+        pat = re.compile(r"^JLP\.piano\." + re.escape(cue) + r"\.", re.IGNORECASE)
+        for f in MERGED_DIR.iterdir():
+            if f.suffix.lower() == ".mxl" and pat.match(f.name):
+                try:
+                    tree  = load_xml(f)
+                    root  = tree.getroot()
+                    parts = root.findall("part")
+                    if parts:
+                        return len(parts[0].findall("measure"))
+                except Exception:
+                    pass
+
+    # Fall back to raw XMLs when piano is marked complete in check state
+    state = load_state()
+    if not state.get(f"piano.{cue}", {}).get("complete"):
+        return None
+    raw_piano = group_raw_xmls(RAW_DIR, filter_inst="piano", filter_cue=cue)
+    for (pi, pc, _), parts_list in raw_piano.items():
+        if pi == "piano" and pc == cue:
+            total = 0
+            for xml_path, _ in parts_list:
+                try:
+                    root = ET.parse(str(xml_path)).getroot()
+                    part, _ = extract_primary_part(root, "piano")
+                    if part is None:
+                        all_parts = root.findall("part")
+                        part = all_parts[0] if all_parts else None
+                    if part is not None and len(part):
+                        total += len(part.findall("measure"))
+                except Exception:
+                    pass
+            return total or None
+    return None
+
+
+def _piano_pdf_ocr_total(cue: str) -> "int | None":
+    """OCR the piano source PDF last page for the highest measure number. Cap at 400."""
+    if not _OCR_AVAILABLE:
+        return None
+    piano_pdf = _find_source_pdf("piano", cue, "")
+    if piano_pdf is None:
+        return None
+    try:
+        doc         = fitz.open(str(piano_pdf))
+        total_pages = len(doc)
+        for back in range(min(3, total_pages)):
+            candidate = _ocr_page_max_measure(doc[-(back + 1)], full_page=(back > 0))
+            if candidate is not None:
+                doc.close()
+                capped = min(candidate, 400)
+                return capped
+        doc.close()
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_cue_total(
+    cue:               str,
+    inst:              str,
+    inst_total_measures: int,
+    totals:            dict,
+    state:             dict,
+) -> "tuple[int | None, str]":
+    """
+    Determine total measures for a cue using the four-level priority chain.
+    Updates totals in-place for discovered values (caller saves).
+
+    Priority:
+      1. manual         — set via --set-total; never overwritten here
+      2. piano_export   — merged or complete raw piano XMLs; or the piano being merged now
+      3. piano_ocr      — OCR of piano source PDF
+      4. ocr_estimate   — per-instrument OCR from check-phase state
+      (estimated_pages  — total_pages × 30 last-resort fallback, not persisted)
+
+    Returns (total_int_or_None, source_string).
+    """
+    existing = totals.get(cue, {})
+
+    # 1. Manual — highest priority, immutable
+    if existing.get("source") == "manual" and "total" in existing:
+        return existing["total"], "manual"
+
+    # 2. Piano export — if we're merging piano right now, this IS the count
+    if inst == "piano":
+        totals[cue] = {"total": inst_total_measures, "source": "piano_export"}
+        print(f"   Cue {cue} total: {inst_total_measures} measures (from piano export)")
+        return inst_total_measures, "piano_export"
+
+    if existing.get("source") == "piano_export" and "total" in existing:
+        return existing["total"], "piano_export"
+
+    piano_exp = _piano_export_total(cue)
+    if piano_exp is not None:
+        totals[cue] = {"total": piano_exp, "source": "piano_export"}
+        print(f"   Cue {cue} total: {piano_exp} measures (from piano export)")
+        return piano_exp, "piano_export"
+
+    # 3. Piano PDF OCR
+    if existing.get("source") == "piano_ocr" and "total" in existing:
+        return existing["total"], "piano_ocr"
+
+    piano_ocr = _piano_pdf_ocr_total(cue)
+    if piano_ocr is not None:
+        totals[cue] = {"total": piano_ocr, "source": "piano_ocr"}
+        print(f"   Cue {cue} total: ~{piano_ocr} measures (OCR from piano PDF)")
+        return piano_ocr, "piano_ocr"
+
+    # 4. Per-instrument OCR cached from check phase
+    score_m = state.get(f"{inst}.{cue}", {}).get("last_score_measure")
+    if score_m:
+        return score_m, "ocr_estimate"
+
+    # Last-resort page estimate (not persisted — too coarse)
+    total_pages = state.get(f"{inst}.{cue}", {}).get("total_pages")
+    if total_pages:
+        return total_pages * 30, "estimated_pages"
+
+    return None, "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Phase: merge
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _merge_group(inst: str, cue: str, title: str, xml_paths: list) -> "Path | None":
-    """Merge xml_paths into a single MXL in MERGED_DIR. Returns output path or None."""
+def _merge_group(inst: str, cue: str, title: str, xml_paths: list):
+    """
+    Merge xml_paths into a single MXL in MERGED_DIR.
+    Returns (out_path, total_measures, uncertain_measure_nums) on success,
+    or (None, 0, []) on error.
+    uncertain_measure_nums is a sorted list of integer measure numbers that
+    contain at least one note with a duration type containing '?'.
+    """
     out_path = MERGED_DIR / f"JLP.{inst}.{cue}.{title}.mxl"
     src_has_tempo = False
     raw_parts = []
@@ -1160,12 +1520,12 @@ def _merge_group(inst: str, cue: str, title: str, xml_paths: list) -> "Path | No
             tree = load_xml(path)
         except Exception as exc:
             print(f"   [error] loading {path.name}: {exc}", file=sys.stderr)
-            return None
+            return None, 0, []
         root = tree.getroot()
         part, pname = extract_primary_part(root, inst)
         if part is None:
             print(f"   [error] no <part> in {path.name}", file=sys.stderr)
-            return None
+            return None, 0, []
         if idx == 0:
             src_has_tempo = _has_tempo(root)
         raw_parts.append((deepcopy(part), path))
@@ -1193,9 +1553,15 @@ def _merge_group(inst: str, cue: str, title: str, xml_paths: list) -> "Path | No
         print(f"   [octave-fix] median MIDI {med:.1f} > {OCTAVE_CEILINGS[inst]}; "
               f"shifted down 1 octave")
 
-    # Unknown durations
-    for mn in find_unknown_duration_measures(merged):
-        print(f"   [warning] unresolved duration in measure {mn}")
+    # Collect uncertain measure numbers (duration type contains '?')
+    uncertain = []
+    for raw_mn in find_unknown_duration_measures(merged):
+        print(f"   [warning] unresolved duration in measure {raw_mn}")
+        try:
+            uncertain.append(int(raw_mn))
+        except (ValueError, TypeError):
+            pass
+    uncertain.sort()
 
     # Switch detection
     for mn, pat, prog in detect_and_inject_switches(merged, inst):
@@ -1218,7 +1584,7 @@ def _merge_group(inst: str, cue: str, title: str, xml_paths: list) -> "Path | No
 
     size = write_mxl(ET.ElementTree(score), out_path)
     print(f"   → {out_path.name}  ({total_measures} measures, {size:,} bytes)")
-    return out_path
+    return out_path, total_measures, uncertain
 
 
 def phase_merge(args):
@@ -1230,7 +1596,10 @@ def phase_merge(args):
         print(f"No JLP-named XML files found in: {RAW_DIR}")
         return
 
-    state = load_state()
+    state     = load_state()
+    punchlist = load_punchlist()
+    totals    = load_totals()
+    answers   = load_answers()
     merged_count  = 0
     skipped_count = 0
 
@@ -1252,8 +1621,8 @@ def phase_merge(args):
 
         xml_paths = [p for p, _ in parts]
         print(f"── {inst} / cue {cue}  ({len(xml_paths)} part(s))")
-        result = _merge_group(inst, cue, title, xml_paths)
-        if result:
+        out_path_result, total_measures, uncertain = _merge_group(inst, cue, title, xml_paths)
+        if out_path_result:
             merged_count += 1
             TRASH_DIR.mkdir(parents=True, exist_ok=True)
             for xml_path in xml_paths:
@@ -1270,6 +1639,49 @@ def phase_merge(args):
                 if f.suffix.lower() == ".pdf" and chunk_pdf_pat.match(f.name):
                     shutil.move(str(f), str(TRASH_MERGED_DIR / f.name))
                     print(f"   Moved to trash/merged/: {f.name}")
+
+            # ── Punchlist: resolve total and compute missing ranges ──────────
+            score_total, total_source = _resolve_cue_total(
+                cue, inst, total_measures, totals, state
+            )
+            save_totals(totals)   # persist any newly discovered total
+
+            # Trigger 1: total still unknown — ask user
+            if score_total is None:
+                q_key = f"cue:{cue}:total_measures"
+                ans = _ask_question(
+                    key=q_key,
+                    context=f"cue {cue}",
+                    description=[
+                        f"Could not determine total measure count for cue {cue}.",
+                        f"No piano export, piano PDF OCR, or per-instrument estimate",
+                        f"is available.",
+                    ],
+                    question=f"How many total measures does cue {cue} have?",
+                    hint="Count the measures in the full score or check the conductor score",
+                    answers=answers,
+                    args=args,
+                )
+                if ans and ans.strip().lstrip("-").isdigit():
+                    score_total  = int(ans.strip())
+                    total_source = "user_answer"
+                    totals[cue]  = {"total": score_total, "source": "user_answer"}
+                    save_totals(totals)
+                    print(f"   Cue {cue} total: {score_total} measures (user answer)")
+
+            missing = []
+            if score_total and score_total > total_measures:
+                missing = [[total_measures + 1, score_total]]
+
+            punchlist.setdefault(cue, {})["_title"] = title
+            punchlist[cue][inst] = {
+                "captured_through": total_measures,
+                "missing":          missing,
+                "uncertain":        uncertain,
+                "total":            score_total or total_measures,
+                "total_source":     total_source,
+            }
+            save_punchlist(punchlist)
         print()
 
     print(f"Summary: {merged_count} merged, {skipped_count} skipped")
@@ -1357,6 +1769,283 @@ def phase_assemble(args):
         print()
 
     print(f"Summary: {assembled_count} assembled, {skipped_count} skipped")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase: punchlist
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_title(raw: str) -> str:
+    return raw.replace("_", " ").upper()
+
+
+def _parse_measure_range(s: str) -> "tuple[int,int] | None":
+    """Parse '107' → (107,107) or '100-120' → (100,120). Returns None on error."""
+    s = s.strip()
+    if "-" in s:
+        parts = s.split("-", 1)
+        try:
+            return int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+    try:
+        n = int(s)
+        return n, n
+    except ValueError:
+        return None
+
+
+def _inst_overlaps_range(entry: dict, lo: int, hi: int) -> "str | None":
+    """
+    Return 'missing' if a missing range overlaps [lo,hi],
+    'uncertain' if an uncertain measure falls in [lo,hi], else None.
+    """
+    for start, end in entry.get("missing", []):
+        if start <= hi and end >= lo:
+            return "missing"
+    for m in entry.get("uncertain", []):
+        if lo <= m <= hi:
+            return "uncertain"
+    return None
+
+
+def _render_cue_punchlist(cue: str, cue_data: dict, out: list, inst_filter: "str | None" = None):
+    """Append formatted punchlist lines for one cue to out.
+    If inst_filter is given only that instrument is shown."""
+    title_raw = cue_data.get("_title", "")
+    header = f"CUE {cue}"
+    if title_raw:
+        header += f" - {_fmt_title(title_raw)}"
+    header += " — PUNCH LIST"
+    if inst_filter:
+        header += f" ({inst_filter})"
+
+    bar = "═" * (len(header) + 8)
+    out.append(bar)
+    out.append(f"═══ {header} ═══")
+    out.append(bar)
+    out.append("")
+
+    needs_work:    list = []
+    complete_insts: list = []
+    not_exported:   list = []
+
+    visible = [inst_filter] if inst_filter else INSTRUMENTS
+    for inst in visible:
+        if inst not in cue_data:
+            not_exported.append(inst)
+            continue
+        entry       = cue_data[inst]
+        n_missing   = sum(end - start + 1 for start, end in entry.get("missing",   []))
+        n_uncertain = len(entry.get("uncertain", []))
+        if n_missing == 0 and n_uncertain == 0:
+            complete_insts.append(inst)
+        else:
+            needs_work.append((inst, entry, n_missing, n_uncertain))
+
+    if needs_work:
+        out.append("Instruments requiring manual MIDI entry:")
+        out.append("")
+        for inst, entry, n_missing, n_uncertain in needs_work:
+            out.append(f"  {inst.upper()}")
+            captured = entry.get("captured_through", 0)
+            out.append(f"    Captured:   m1–m{captured}")
+            for start, end in entry.get("missing", []):
+                n = end - start + 1
+                out.append(f"    Missing:    m{start}–m{end}  ({n} measures — end of score not exported)")
+            uncertain = entry.get("uncertain", [])
+            if uncertain:
+                unc_str = ", ".join(f"m{n}" for n in uncertain)
+                out.append(f"    Uncertain:  {unc_str}  (rhythm unresolved — verify)")
+            out.append("")
+    else:
+        out.append("No instruments require manual MIDI entry.")
+        out.append("")
+
+    if complete_insts:
+        out.append("Instruments complete:")
+        out.append(f"  {', '.join(complete_insts)} ✓")
+        out.append("")
+
+    if not_exported:
+        out.append("Not yet exported:")
+        out.append(f"  {', '.join(not_exported)}")
+        out.append("")
+
+    if needs_work:
+        total_miss = sum(m for _, _, m, _ in needs_work)
+        total_unc  = sum(u for _, _, _, u in needs_work)
+        parts_str: list = []
+        if total_miss:
+            parts_str.append(f"{total_miss} missing")
+        if total_unc:
+            parts_str.append(f"{total_unc} uncertain")
+        total_manual = total_miss + total_unc
+        out.append(f"Total manual measures needed: {' + '.join(parts_str)} = {total_manual} measures")
+
+
+def _render_measure_view(cue: str, cue_data: dict, lo: int, hi: int, out: list,
+                         inst_filter: "str | None" = None):
+    """Append measure-centric view for one cue showing per-instrument status in [lo,hi]."""
+    title_raw = cue_data.get("_title", "")
+    range_str = f"m{lo}" if lo == hi else f"m{lo}-{hi}"
+    cue_label = f"CUE {cue}"
+    if title_raw:
+        cue_label += f" {_fmt_title(title_raw)}"
+    header = f"{cue_label} — {range_str.upper()} — ALL INSTRUMENTS"
+
+    bar = "═" * (len(header) + 8)
+    out.append(bar)
+    out.append(f"═══ {header} ═══")
+    out.append(bar)
+    out.append("")
+    out.append(f"  {range_str}:")
+
+    visible   = [inst_filter] if inst_filter else INSTRUMENTS
+    name_w    = max(len(inst.capitalize()) for inst in visible) + 1   # +1 for ":"
+    for inst in visible:
+        name = inst.capitalize() + ":"
+        if inst not in cue_data:
+            status = "not exported"
+        else:
+            overlap = _inst_overlaps_range(cue_data[inst], lo, hi)
+            if overlap == "missing":
+                status = "MISSING (not exported)"
+            elif overlap == "uncertain":
+                status = "UNCERTAIN (verify)"
+            else:
+                status = "complete ✓"
+        out.append(f"    {name:<{name_w}}  {status}")
+
+    out.append("")
+    out.append("  Useful when working in MuseScore on the assembled score —")
+    out.append("  look up any measure range to see which instruments need attention there.")
+
+
+def _render_summary(punchlist: dict, out: list, cues: list, inst_filter: "str | None" = None):
+    """Append compact one-line-per-cue summary to out."""
+    header = "═══ PUNCH LIST SUMMARY ═══"
+    if inst_filter:
+        header = f"═══ PUNCH LIST SUMMARY — {inst_filter.upper()} ═══"
+    out.append(header)
+    out.append("")
+
+    # Pre-compute label widths for alignment
+    labels = []
+    for cue in cues:
+        title_raw = punchlist[cue].get("_title", "")
+        label = f"Cue {cue}"
+        if title_raw:
+            label += f" {_fmt_title(title_raw)}"
+        labels.append(label)
+    col_w = max(len(lb) for lb in labels) + 1   # +1 for ":"
+
+    show_miss = 0
+    show_unc  = 0
+
+    for label, cue in zip(labels, cues):
+        cue_data = punchlist[cue]
+        visible  = [inst_filter] if inst_filter else INSTRUMENTS
+
+        inst_issues: list = []
+        has_data = False
+        cue_miss = 0
+        cue_unc  = 0
+
+        for inst in visible:
+            if inst not in cue_data:
+                continue
+            has_data = True
+            entry    = cue_data[inst]
+            n_miss   = sum(end - start + 1 for start, end in entry.get("missing", []))
+            n_unc    = len(entry.get("uncertain", []))
+            cue_miss += n_miss
+            cue_unc  += n_unc
+            if n_miss or n_unc:
+                issue_parts: list = []
+                for start, end in entry.get("missing", []):
+                    issue_parts.append(f"m{start}-{end}")
+                if n_unc and not entry.get("missing"):
+                    issue_parts.append(f"({n_unc} uncertain)")
+                elif n_unc:
+                    issue_parts.append(f"+{n_unc} uncertain")
+                inst_issues.append(f"{inst} {' '.join(issue_parts)}")
+
+        show_miss += cue_miss
+        show_unc  += cue_unc
+        total_manual = cue_miss + cue_unc
+
+        col = (label + ":").ljust(col_w)
+        if inst_issues:
+            suffix = f" ({total_manual} measures total)" if total_manual else ""
+            out.append(f"  {col}  {', '.join(inst_issues)}{suffix}")
+        elif has_data:
+            out.append(f"  {col}  all complete ✓")
+        else:
+            out.append(f"  {col}  pending export")
+
+    out.append("")
+    out.append(f"Total across show: {show_miss} missing, {show_unc} uncertain")
+
+
+def phase_punchlist(args):
+    punchlist = load_punchlist()
+
+    if not punchlist:
+        print("No punchlist data yet. Run --phase merge to generate it.")
+        return
+
+    out: list = []
+
+    # Parse --measure if provided
+    measure_range: "tuple[int,int] | None" = None
+    if getattr(args, "measure", None):
+        measure_range = _parse_measure_range(args.measure)
+        if measure_range is None:
+            print(f"[error] --measure: expected N or N-M, got {args.measure!r}", file=sys.stderr)
+            sys.exit(1)
+
+    cue_filter  = args.cue.upper() if args.cue else None
+    inst_filter = args.instrument   # str or None; already validated by argparse
+
+    # Determine which cues to process
+    if cue_filter:
+        if cue_filter not in punchlist:
+            print(f"No punchlist data for cue {cue_filter}. "
+                  f"Run --phase merge --cue {cue_filter} first.")
+            return
+        cues = [cue_filter]
+    else:
+        cues = sorted(punchlist.keys(), key=_cue_sort)
+
+    # Choose rendering mode
+    if measure_range:
+        lo, hi = measure_range
+        for i, cue in enumerate(cues):
+            if i:
+                out.append("")
+            _render_measure_view(cue, punchlist[cue], lo, hi, out, inst_filter)
+
+    elif getattr(args, "summary", False) or (not cue_filter and not inst_filter):
+        # Compact summary: explicit --summary flag OR bare invocation with no filters
+        _render_summary(punchlist, out, cues, inst_filter)
+
+    else:
+        # Detailed view filtered by cue and/or instrument
+        for i, cue in enumerate(cues):
+            if i:
+                out.append("")
+            _render_cue_punchlist(cue, punchlist[cue], out, inst_filter)
+
+    text = "\n".join(out).rstrip()
+    print(text)
+
+    txt_path = EXPORTS_DIR / "punchlist.txt"
+    try:
+        txt_path.write_text(text + "\n")
+        print(f"\n(Saved to {txt_path.name})")
+    except OSError as exc:
+        print(f"\n[warning] Could not save punchlist.txt: {exc}", file=sys.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1469,13 +2158,117 @@ def phase_status(args):
 # Cache management
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _do_set_total(tokens: list):
+    """Process 'CUE:N ...' tokens from --set-total and persist to .jlp_totals.json."""
+    totals = load_totals()
+    for token in tokens:
+        if ":" not in token:
+            print(f"[warning] --set-total: expected CUE:N, got {token!r}")
+            continue
+        cue_raw, n_raw = token.split(":", 1)
+        cue = cue_raw.upper()
+        try:
+            n = int(n_raw)
+        except ValueError:
+            print(f"[warning] --set-total: {n_raw!r} is not a number, skipping {token!r}")
+            continue
+        totals[cue] = {"total": n, "source": "manual"}
+        print(f"Set cue {cue} total: {n} measures (manual)")
+    save_totals(totals)
+
+
+def _do_show_totals():
+    """Print all cue totals with their source."""
+    totals    = load_totals()
+    punchlist = load_punchlist()
+
+    all_cues = sorted(set(CUE_TEMPOS.keys()) | set(totals.keys()), key=_cue_sort)
+
+    def _cue_title(cue: str) -> str:
+        raw = punchlist.get(cue, {}).get("_title", "")
+        return _fmt_title(raw) if raw else ""
+
+    _SOURCE_LABELS = {
+        "manual":         ("", "manual ✓"),
+        "piano_export":   ("", "piano export ✓"),
+        "piano_ocr":      ("~", "OCR estimate — piano PDF"),
+        "ocr_estimate":   ("~", "OCR estimate"),
+        "estimated_pages":("~", "page estimate"),
+    }
+
+    rows = []
+    for cue in all_cues:
+        label = f"Cue {cue}"
+        title = _cue_title(cue)
+        if title:
+            label += f" {title}"
+        label += ":"
+
+        entry = totals.get(cue, {})
+        if "total" in entry:
+            n   = entry["total"]
+            src = entry.get("source", "unknown")
+            prefix, detail = _SOURCE_LABELS.get(src, ("~", src))
+            measure_str = f"{prefix}{n}"
+            rows.append((label, measure_str, detail))
+        else:
+            rows.append((label, "unknown", ""))
+
+    if not rows:
+        print("No cue totals recorded yet.")
+        return
+
+    col1 = max(len(r[0]) for r in rows)
+    col2 = max(len(r[1]) for r in rows)
+    print()
+    for label, measure_str, detail in rows:
+        if detail:
+            print(f"  {label:<{col1}}  {measure_str:>{col2}} measures  ({detail})")
+        else:
+            print(f"  {label:<{col1}}  {measure_str}")
+    print()
+
+
+def _do_show_answers():
+    """Print all stored Q&A pairs."""
+    answers = load_answers()
+    if not answers:
+        print("No stored answers yet.")
+        return
+    print()
+    for key in sorted(answers.keys()):
+        entry = answers[key]
+        q = entry.get("question", "")
+        a = entry.get("answer", "")
+        print(f"  {key}")
+        if q:
+            print(f"    Q: {q}")
+        print(f"    A: {a!r}")
+    print()
+
+
+def _do_clear_answer(key: str):
+    """Remove a specific stored answer so the question is asked again."""
+    answers = load_answers()
+    if key in answers:
+        del answers[key]
+        save_answers(answers)
+        print(f"Cleared answer for {key!r}. It will be asked again next run.")
+    else:
+        print(f"No stored answer for {key!r}.")
+
+
+_PROTECTED_JSONS = frozenset({".jlp_totals.json", ".jlp_answers.json", ".jlp_punchlist.json"})
+
+
 def _do_reset_state():
-    """Delete all persistent state files for a clean start."""
+    """Delete all persistent state/cache JSON files in exports/ (except protected ones)."""
     deleted = []
-    for f in [STATE_FILE, OVERRIDES_FILE]:
-        if f.exists():
-            f.unlink()
-            deleted.append(f.name)
+    if EXPORTS_DIR.exists():
+        for f in sorted(EXPORTS_DIR.iterdir()):
+            if f.is_file() and f.suffix == ".json" and f.name not in _PROTECTED_JSONS:
+                f.unlink()
+                deleted.append(f.name)
     if deleted:
         print(f"State cleared: {', '.join(deleted)}")
     else:
@@ -1512,14 +2305,15 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 phases:
-  check     scan raw/ vs source PDFs; generate next-chunk PDFs
-  merge     merge complete XML sets into per-instrument MXLs
-  assemble  combine per-instrument MXLs into full-score MXLs
-  status    print progress table (cues × instruments)
+  check      scan raw/ vs source PDFs; generate next-chunk PDFs
+  merge      merge complete XML sets into per-instrument MXLs
+  assemble   combine per-instrument MXLs into full-score MXLs
+  status     print progress table (cues × instruments)
+  punchlist  show missing/uncertain measures per cue
         """,
     )
     p.add_argument("--phase", default=None,
-                   choices=["check", "merge", "assemble", "status"])
+                   choices=["check", "merge", "assemble", "status", "punchlist"])
     p.add_argument("--cue",        default=None, help="Filter to one cue, e.g. 01  01A")
     p.add_argument("--instrument", default=None, choices=INSTRUMENTS,
                    help="Filter to one instrument")
@@ -1531,6 +2325,20 @@ phases:
                    help="Clear cached OCR/measure data: 'bass:01' or 'all'")
     p.add_argument("--reset-state", action="store_true",
                    help="Delete the state file completely for a clean start")
+    p.add_argument("--measure", default=None, metavar="N|N-M",
+                   help="punchlist: show measure-centric view for measure N or range N-M")
+    p.add_argument("--summary", action="store_true",
+                   help="punchlist: compact one-line-per-cue overview")
+    p.add_argument("--set-total", nargs="+", default=[], metavar="CUE:N",
+                   help="Set manual total measures: --set-total 01:123 02:210")
+    p.add_argument("--show-totals", action="store_true",
+                   help="Print all known cue totals and their sources")
+    p.add_argument("--no-interactive", action="store_true",
+                   help="Skip all interactive questions; use best-guess fallbacks")
+    p.add_argument("--show-answers", action="store_true",
+                   help="Print all stored Q&A answers")
+    p.add_argument("--clear-answer", default=None, metavar="KEY",
+                   help="Remove a stored answer so it is asked again, e.g. bass:01:last_measure_page:3")
     return p.parse_args()
 
 
@@ -1539,7 +2347,27 @@ def main():
 
     if args.reset_state:
         _do_reset_state()
-        if args.phase is None and args.clear_cache is None:
+        if args.phase is None and args.clear_cache is None and not args.set_total and not args.show_totals:
+            return
+
+    if args.set_total:
+        _do_set_total(args.set_total)
+        if args.phase is None and not args.show_totals:
+            return
+
+    if args.show_totals:
+        _do_show_totals()
+        if args.phase is None:
+            return
+
+    if args.show_answers:
+        _do_show_answers()
+        if args.phase is None:
+            return
+
+    if args.clear_answer is not None:
+        _do_clear_answer(args.clear_answer)
+        if args.phase is None:
             return
 
     if args.clear_cache is not None:
@@ -1552,10 +2380,11 @@ def main():
         sys.exit(1)
 
     dispatch = {
-        "check":    phase_check,
-        "merge":    phase_merge,
-        "assemble": phase_assemble,
-        "status":   phase_status,
+        "check":     phase_check,
+        "merge":     phase_merge,
+        "assemble":  phase_assemble,
+        "status":    phase_status,
+        "punchlist": phase_punchlist,
     }
     dispatch[args.phase](args)
 

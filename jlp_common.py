@@ -21,6 +21,9 @@ TRASH_MERGED_DIR = TRASH_DIR   / "merged"       # chunk PDFs from fully merged c
 
 STATE_FILE     = EXPORTS_DIR / ".jlp_state.json"
 OVERRIDES_FILE = EXPORTS_DIR / "overrides.json"
+PUNCHLIST_FILE = EXPORTS_DIR / ".jlp_punchlist.json"
+TOTALS_FILE    = EXPORTS_DIR / ".jlp_totals.json"
+ANSWERS_FILE   = EXPORTS_DIR / ".jlp_answers.json"
 
 ALL_DIRS = [RAW_DIR, NEXT_DIR, MERGED_DIR, ASSEMBLED_DIR, READY_DIR, TRASH_DIR]
 
