@@ -1051,10 +1051,20 @@ def phase_check(args):
             print()
             continue
 
-        # ── Step 4: Loop detection ────────────────────────────────────────────
-        # Trigger only when the same XML filename was seen in the previous run,
-        # meaning no new export was produced between runs.
-        if prev_seen == latest_path.name:
+        # ── Step 4: Check for pending chunk / loop detection ─────────────────
+        next_suf   = next_suffix(latest_suffix)
+        chunk_name = f"JLP.{inst}.{cue}.{title}.{next_suf}.pdf"
+        chunk_path = NEXT_DIR / chunk_name
+
+        if chunk_path.exists():
+            ps_name = chunk_path.stem.replace(".", "") + ".xml"
+            print(f"   → Waiting for import: {chunk_path.name}")
+            print(f"      PlayScore will name the export: {ps_name}")
+            chunk_pdfs.append(chunk_path)
+            print()
+            continue
+
+        if prev_seen is not None and prev_seen == latest_path.name:
             print(
                 f"\n[warning] {inst} cue {cue}: PlayScore has exported m{last_m} twice "
                 f"in a row from the same pages. PlayScore may have hit its recognition "
@@ -1068,10 +1078,7 @@ def phase_check(args):
             continue
 
         # ── Step 5: Extract remaining pages ──────────────────────────────────
-        next_suf   = next_suffix(latest_suffix)
-        chunk_name = f"JLP.{inst}.{cue}.{title}.{next_suf}.pdf"
-        chunk_path = NEXT_DIR / chunk_name
-        n_pages    = extract_pages_fixed(pdf_path, page_0 + 1, chunk_path)
+        n_pages = extract_pages_fixed(pdf_path, page_0 + 1, chunk_path)
 
         if n_pages == 0:
             print(f"   ✓ Complete — remaining pages are navigation markers only. Ready to merge.")
@@ -1463,12 +1470,16 @@ def phase_status(args):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _do_reset_state():
-    """Delete the state file entirely for a clean start."""
-    if STATE_FILE.exists():
-        STATE_FILE.unlink()
-        print(f"State file deleted: {STATE_FILE.name}")
+    """Delete all persistent state files for a clean start."""
+    deleted = []
+    for f in [STATE_FILE, OVERRIDES_FILE]:
+        if f.exists():
+            f.unlink()
+            deleted.append(f.name)
+    if deleted:
+        print(f"State cleared: {', '.join(deleted)}")
     else:
-        print("No state file found (nothing to reset).")
+        print("No state files found (nothing to reset).")
 
 
 def _do_clear_cache(target: str):
