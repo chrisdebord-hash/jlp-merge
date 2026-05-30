@@ -1034,7 +1034,10 @@ def phase_check(args):
             continue
 
         # ── Step 4: Loop detection ────────────────────────────────────────────
-        if cached.get("last_generated_for_measure") == last_m:
+        # Trigger only when the SAME XML file was already seen last run — not
+        # when a new XML happens to end on the same measure number as a cached
+        # value from a different session or a different part file.
+        if cached.get("last_generated_for_xml") == latest_path.name:
             print(
                 f"\n[warning] {inst} cue {cue}: PlayScore has exported m{last_m} twice "
                 f"in a row from the same pages. PlayScore may have hit its recognition "
@@ -1071,7 +1074,7 @@ def phase_check(args):
                 shutil.move(str(consumed_pdf), str(TRASH_DIR / consumed_name))
                 print(f"   Moved to trash/: {consumed_name}")
 
-        cached["last_generated_for_measure"] = last_m
+        cached["last_generated_for_xml"] = latest_path.name
         save_state(state)
 
         ps_name = chunk_path.stem.replace(".", "") + ".xml"
@@ -1434,6 +1437,33 @@ def phase_status(args):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Cache management
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _do_clear_cache(target: str):
+    """Delete cached OCR/measure data for one inst:cue or all entries."""
+    state = load_state()
+    if target.strip().lower() == "all":
+        count = len(state)
+        state.clear()
+        save_state(state)
+        print(f"Cleared cache for all {count} entry/entries.")
+        return
+    if ":" not in target:
+        print(f"[error] --clear-cache expects inst:cue or 'all', got {target!r}",
+              file=sys.stderr)
+        return
+    inst, cue = target.split(":", 1)
+    key = f"{inst.lower()}.{cue.upper()}"
+    if key in state:
+        del state[key]
+        save_state(state)
+        print(f"Cleared cache for {inst.lower()} cue {cue.upper()}.")
+    else:
+        print(f"No cache entry for {inst.lower()} cue {cue.upper()} (nothing to clear).")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1449,7 +1479,7 @@ phases:
   status    print progress table (cues × instruments)
         """,
     )
-    p.add_argument("--phase", required=True,
+    p.add_argument("--phase", default=None,
                    choices=["check", "merge", "assemble", "status"])
     p.add_argument("--cue",        default=None, help="Filter to one cue, e.g. 01  01A")
     p.add_argument("--instrument", default=None, choices=INSTRUMENTS,
@@ -1458,11 +1488,23 @@ phases:
                    help="Re-process even if output already exists / result cached")
     p.add_argument("--mark-complete", nargs="+", default=[], metavar="INST:CUE",
                    help="Force inst:cue pairs complete, e.g. bass:01 violin:01")
+    p.add_argument("--clear-cache", default=None, metavar="INST:CUE|all",
+                   help="Clear cached OCR/measure data: 'bass:01' or 'all'")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.clear_cache is not None:
+        _do_clear_cache(args.clear_cache)
+        if args.phase is None:
+            return
+
+    if args.phase is None:
+        print("error: --phase is required", file=sys.stderr)
+        sys.exit(1)
+
     dispatch = {
         "check":    phase_check,
         "merge":    phase_merge,
