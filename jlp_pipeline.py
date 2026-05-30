@@ -1462,19 +1462,25 @@ def phase_status(args):
 # Cache management
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _do_reset_state():
+    """Delete the state file entirely for a clean start."""
+    if STATE_FILE.exists():
+        STATE_FILE.unlink()
+        print(f"State file deleted: {STATE_FILE.name}")
+    else:
+        print("No state file found (nothing to reset).")
+
+
 def _do_clear_cache(target: str):
-    """Delete cached OCR/measure data for one inst:cue or all entries."""
-    state = load_state()
+    """Delete cached OCR/measure data for one inst:cue, or wipe the state file for 'all'."""
     if target.strip().lower() == "all":
-        count = len(state)
-        state.clear()
-        save_state(state)
-        print(f"Cleared cache for all {count} entry/entries.")
+        _do_reset_state()
         return
     if ":" not in target:
         print(f"[error] --clear-cache expects inst:cue or 'all', got {target!r}",
               file=sys.stderr)
         return
+    state = load_state()
     inst, cue = target.split(":", 1)
     key = f"{inst.lower()}.{cue.upper()}"
     if key in state:
@@ -1512,11 +1518,18 @@ phases:
                    help="Force inst:cue pairs complete, e.g. bass:01 violin:01")
     p.add_argument("--clear-cache", default=None, metavar="INST:CUE|all",
                    help="Clear cached OCR/measure data: 'bass:01' or 'all'")
+    p.add_argument("--reset-state", action="store_true",
+                   help="Delete the state file completely for a clean start")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.reset_state:
+        _do_reset_state()
+        if args.phase is None and args.clear_cache is None:
+            return
 
     if args.clear_cache is not None:
         _do_clear_cache(args.clear_cache)
