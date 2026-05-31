@@ -154,12 +154,19 @@ def parse_playscorename(path: Path):
     if inst is None:
         return None
 
-    # Match cue — longest first so "01A" is tried before "01"
+    # Match cue — longest first so "01A" is tried before "01".
+    # After a candidate matches, check the character immediately following:
+    # if it is a lowercase letter the suffix letter was the start of a title
+    # word (e.g. "02All…" → 'A' belongs to "All", not cue "02A"), so skip
+    # that candidate and continue to shorter ones.
     cue = None
     for candidate in sorted(CUE_TEMPOS.keys(), key=len, reverse=True):
         if rest.upper().startswith(candidate.upper()):
-            cue = candidate
-            rest = rest[len(candidate):]
+            after = rest[len(candidate):]
+            if after and after[0].islower():
+                continue   # suffix letter is part of the title word
+            cue  = candidate
+            rest = after
             break
     if cue is None:
         return None
