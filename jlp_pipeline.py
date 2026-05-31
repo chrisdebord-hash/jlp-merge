@@ -1080,6 +1080,8 @@ def phase_check(args):
     state     = load_state()
     overrides = load_overrides()
     answers   = load_answers()
+    punchlist = load_punchlist()
+    totals    = load_totals()
 
     # Process --mark-complete flags before scanning
     if args.mark_complete:
@@ -1179,6 +1181,13 @@ def phase_check(args):
             save_state(state)
         print(f"   Total pages: {total_pages}")
 
+        # Flag short cues (≤2 pages, known total <10 measures) so the punchlist
+        # can suggest manual entry instead of a difficult re-export.
+        known_total = totals.get(cue, {}).get("total")
+        if total_pages <= 2 and known_total and known_total < 10:
+            punchlist.setdefault(cue, {})["_short_cue"] = True
+            save_punchlist(punchlist)
+
         # ── Step 2: Build page coverage for every XML in the group ───────────
         # For the no-suffix (first) XML: measure numbers printed in the score
         # match the source PDF, so we can scan for the last measure to find
@@ -1190,6 +1199,7 @@ def phase_check(args):
         cached_parts_by_name = {p["filename"]: p for p in cached.get("parts", [])}
         new_parts: list = []
         prev_end  = 0   # highest 1-based source page covered so far
+        xml_parse_failed = False  # set True when a file cannot be parsed even after repair
 
         for xml_path, xml_suffix in parts:   # oldest → newest by mtime
             fname = xml_path.name
@@ -1216,6 +1226,26 @@ def phase_check(args):
             try:
                 last_m = last_measure_number(xml_path)
             except ValueError as exc:
+                if "repair failed" in str(exc) or "XML parse error" in str(exc):
+                    # Structural parse failure — cannot read this file at all.
+                    # Log the skip, record the whole inst+cue as malformed in
+                    # the punchlist, and abandon the rest of this group.
+                    print(f"   [skipped] {fname} — malformed XML, could not repair. "
+                          f"Added to punchlist as fully missing.")
+                    est_total = total_pages * 30
+                    punchlist.setdefault(cue, {})["_title"] = title
+                    punchlist[cue][inst] = {
+                        "malformed":        True,
+                        "captured_through": 0,
+                        "missing":          [[1, est_total]],
+                        "uncertain":        [],
+                        "total":            est_total,
+                        "total_source":     "estimated_pages",
+                    }
+                    save_punchlist(punchlist)
+                    xml_parse_failed = True
+                    break   # exits the inner `for xml_path` loop
+                # Semantic failure (e.g. no numeric measures found) — use fallback
                 print(f"   [error] {exc}")
                 fallback_pages = [1] if xml_suffix is None else list(range(prev_end + 1, total_pages + 1))
                 new_parts.append({"filename": fname, "pages": fallback_pages})
@@ -1280,6 +1310,10 @@ def phase_check(args):
                     xml_pages = list(range(prev_end + 1, total_pages + 1))
                     prev_end  = total_pages
                     new_parts.append({"filename": fname, "pages": xml_pages})
+
+        if xml_parse_failed:
+            print()
+            continue   # skip coverage / completion steps for this group
 
         # Compute overall coverage and update state
         covered  = sorted(set(p for e in new_parts for p in e.get("pages", [])))
@@ -1738,6 +1772,19 @@ def phase_merge(args):
         xml_paths = [p for p, _ in parts]
         print(f"── {inst} / cue {cue}  ({len(xml_paths)} part(s))")
         out_path_result, total_measures, uncertain = _merge_group(inst, cue, title, xml_paths)
+        if not out_path_result:
+            # Merge failed (unrecoverable parse error) — record as malformed
+            est_total = state.get(f"{inst}.{cue}", {}).get("total_pages", 1) * 30
+            punchlist.setdefault(cue, {})["_title"] = title
+            punchlist[cue][inst] = {
+                "malformed":        True,
+                "captured_through": 0,
+                "missing":          [[1, est_total]],
+                "uncertain":        [],
+                "total":            est_total,
+                "total_source":     "estimated_pages",
+            }
+            save_punchlist(punchlist)
         if out_path_result:
             merged_count += 1
             TRASH_DIR.mkdir(parents=True, exist_ok=True)
@@ -1788,6 +1835,11 @@ def phase_merge(args):
             missing = []
             if score_total and score_total > total_measures:
                 missing = [[total_measures + 1, score_total]]
+
+            # Flag short cues so the punchlist can suggest manual MIDI entry
+            total_pages_cached = state.get(f"{inst}.{cue}", {}).get("total_pages", 0)
+            if total_pages_cached <= 2 and score_total and score_total < 10:
+                punchlist.setdefault(cue, {})["_short_cue"] = True
 
             punchlist.setdefault(cue, {})["_title"] = title
             punchlist[cue][inst] = {
@@ -1915,7 +1967,10 @@ def _inst_overlaps_range(entry: dict, lo: int, hi: int) -> "str | None":
     """
     Return 'missing' if a missing range overlaps [lo,hi],
     'uncertain' if an uncertain measure falls in [lo,hi], else None.
+    Malformed entries are treated as fully missing.
     """
+    if entry.get("malformed"):
+        return "missing"
     for start, end in entry.get("missing", []):
         if start <= hi and end >= lo:
             return "missing"
@@ -1942,7 +1997,13 @@ def _render_cue_punchlist(cue: str, cue_data: dict, out: list, inst_filter: "str
     out.append(bar)
     out.append("")
 
-    needs_work:    list = []
+    if cue_data.get("_short_cue"):
+        out.append("[note] Short cue — may be faster to enter all measures manually "
+                   "in MuseScore than to re-export from PlayScore")
+        out.append("")
+
+    needs_work:     list = []
+    malformed_insts: list = []
     complete_insts: list = []
     not_exported:   list = []
 
@@ -1951,13 +2012,24 @@ def _render_cue_punchlist(cue: str, cue_data: dict, out: list, inst_filter: "str
         if inst not in cue_data:
             not_exported.append(inst)
             continue
-        entry       = cue_data[inst]
+        entry = cue_data[inst]
+        if entry.get("malformed"):
+            malformed_insts.append(inst)
+            continue
         n_missing   = sum(end - start + 1 for start, end in entry.get("missing",   []))
         n_uncertain = len(entry.get("uncertain", []))
         if n_missing == 0 and n_uncertain == 0:
             complete_insts.append(inst)
         else:
             needs_work.append((inst, entry, n_missing, n_uncertain))
+
+    if malformed_insts:
+        out.append("Malformed exports — re-export required:")
+        out.append("")
+        for inst in malformed_insts:
+            out.append(f"  {inst.upper()}")
+            out.append(f"    MALFORMED EXPORT — all measures missing, re-export required")
+            out.append("")
 
     if needs_work:
         out.append("Instruments requiring manual MIDI entry:")
@@ -1974,7 +2046,8 @@ def _render_cue_punchlist(cue: str, cue_data: dict, out: list, inst_filter: "str
                 unc_str = ", ".join(f"m{n}" for n in uncertain)
                 out.append(f"    Uncertain:  {unc_str}  (rhythm unresolved — verify)")
             out.append("")
-    else:
+
+    if not malformed_insts and not needs_work:
         out.append("No instruments require manual MIDI entry.")
         out.append("")
 
@@ -1988,16 +2061,23 @@ def _render_cue_punchlist(cue: str, cue_data: dict, out: list, inst_filter: "str
         out.append(f"  {', '.join(not_exported)}")
         out.append("")
 
-    if needs_work:
-        total_miss = sum(m for _, _, m, _ in needs_work)
-        total_unc  = sum(u for _, _, _, u in needs_work)
+    if needs_work or malformed_insts:
         parts_str: list = []
-        if total_miss:
-            parts_str.append(f"{total_miss} missing")
-        if total_unc:
-            parts_str.append(f"{total_unc} uncertain")
-        total_manual = total_miss + total_unc
-        out.append(f"Total manual measures needed: {' + '.join(parts_str)} = {total_manual} measures")
+        total_manual = 0
+        if needs_work:
+            total_miss = sum(m for _, _, m, _ in needs_work)
+            total_unc  = sum(u for _, _, _, u in needs_work)
+            if total_miss:
+                parts_str.append(f"{total_miss} missing")
+            if total_unc:
+                parts_str.append(f"{total_unc} uncertain")
+            total_manual = total_miss + total_unc
+        if malformed_insts:
+            parts_str.append(f"{len(malformed_insts)} instrument(s) fully missing (malformed)")
+        if total_manual:
+            out.append(f"Total manual measures needed: {' + '.join(parts_str)} = {total_manual} measures")
+        else:
+            out.append(f"Total manual measures needed: {' + '.join(parts_str)}")
 
 
 def _render_measure_view(cue: str, cue_data: dict, lo: int, hi: int, out: list,
