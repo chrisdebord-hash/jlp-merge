@@ -1123,11 +1123,21 @@ def phase_check(args):
         d.mkdir(parents=True, exist_ok=True)
     TRASH_MERGED_DIR.mkdir(parents=True, exist_ok=True)
 
+    if getattr(args, "no_interactive", False):
+        print("[info] Non-interactive mode — ambiguous cases will use best-guess fallbacks")
+
     state     = load_state()
     overrides = load_overrides()
     answers   = load_answers()
     punchlist = load_punchlist()
     totals    = load_totals()
+
+    # Belt-and-suspenders: if --reset-state was given alongside --phase check,
+    # scrub per-instrument stale keys even if the file deletion raced with a
+    # cloud-sync daemon that restored the old state file.
+    if getattr(args, "reset_state", False) and state:
+        _scrub_stale_keys(state)
+        save_state(state)
 
     # Process --mark-complete flags before scanning
     if args.mark_complete:
@@ -2516,19 +2526,68 @@ def _do_clear_answer(key: str):
 
 _PROTECTED_JSONS = frozenset({".jlp_totals.json", ".jlp_answers.json", ".jlp_punchlist.json"})
 
+# Keys stored per instrument+cue inside .jlp_state.json that become stale
+# across sessions and must be wiped on --reset-state.
+_STATE_STALE_KEYS = frozenset({
+    "last_measure_page_0",
+    "covered_pages",
+    "parts",
+    "pending_chunk",
+    "last_seen_xml",
+    "complete",
+    "last_measure",
+    "last_score_measure",
+    "vs_last_page",
+    "pdf_path",
+    "total_pages",
+})
+
+
+def _scrub_stale_keys(state: dict) -> dict:
+    """Remove per-instrument stale cache keys from every entry in *state* in-place."""
+    for entry in state.values():
+        if isinstance(entry, dict):
+            for k in _STATE_STALE_KEYS:
+                entry.pop(k, None)
+    return state
+
 
 def _do_reset_state():
-    """Delete all persistent state/cache JSON files in exports/ (except protected ones)."""
-    deleted = []
+    """
+    Clear all persistent state in exports/.
+
+    Two-phase approach for reliability on iCloud Drive where a deleted file
+    can be restored by the sync daemon before the next read:
+
+    Phase 1: Delete every non-protected .json file found in EXPORTS_DIR.
+             Each deletion is attempted individually so one failure does not
+             abort the rest.
+    Phase 2: Write an empty {} to STATE_FILE.  Even if the old file reappears
+             via cloud sync, the next load_state() call will read {}.
+    """
+    deleted  = []
+    warnings = []
     if EXPORTS_DIR.exists():
         for f in sorted(EXPORTS_DIR.iterdir()):
             if f.is_file() and f.suffix == ".json" and f.name not in _PROTECTED_JSONS:
-                f.unlink()
-                deleted.append(f.name)
+                try:
+                    f.unlink()
+                    deleted.append(f.name)
+                except OSError as exc:
+                    warnings.append(f"{f.name}: {exc}")
+
+    # Guarantee clean state regardless of file-system race conditions.
+    try:
+        save_state({})
+    except OSError:
+        pass
+
     if deleted:
         print(f"State cleared: {', '.join(deleted)}")
     else:
         print("No state files found (nothing to reset).")
+    for w in warnings:
+        print(f"[warning] Could not delete {w}", file=sys.stderr)
 
 
 def _do_clear_cache(target: str):
