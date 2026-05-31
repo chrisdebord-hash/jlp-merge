@@ -1832,6 +1832,19 @@ def phase_merge(args):
 
         if out_path.exists() and not args.force:
             print(f"── {inst}/{cue}  skipped (already exists: {out_path.name})")
+            # The MXL exists but XMLs in raw/ may be left over from a run that
+            # wrote the MXL and then was interrupted before finishing the
+            # trash-move.  Clean them up now so raw/ stays tidy.
+            leftover = [p for p, _ in parts if p.exists()]
+            if leftover:
+                TRASH_DIR.mkdir(parents=True, exist_ok=True)
+                for xml_path in leftover:
+                    try:
+                        shutil.move(str(xml_path), str(TRASH_DIR / xml_path.name))
+                        print(f"   Moved to trash/: {xml_path.name}  (leftover from previous run)")
+                    except (OSError, shutil.Error) as exc:
+                        print(f"   [warning] Could not move {xml_path.name}: {exc}",
+                              file=sys.stderr)
             skipped_count += 1
             continue
 
@@ -1861,9 +1874,17 @@ def phase_merge(args):
             merged_count += 1
             TRASH_DIR.mkdir(parents=True, exist_ok=True)
             for xml_path in xml_paths:
+                if not xml_path.exists():
+                    print(f"   [warning] {xml_path.name} not found in raw/ — already moved?",
+                          file=sys.stderr)
+                    continue
                 dest = TRASH_DIR / xml_path.name
-                shutil.move(str(xml_path), str(dest))
-                print(f"   Moved to trash/: {xml_path.name}")
+                try:
+                    shutil.move(str(xml_path), str(dest))
+                    print(f"   Moved to trash/: {xml_path.name}")
+                except (OSError, shutil.Error) as exc:
+                    print(f"   [warning] Could not move {xml_path.name} to trash/: {exc}",
+                          file=sys.stderr)
             # Move matching chunk PDFs from trash/ into trash/merged/
             TRASH_MERGED_DIR.mkdir(parents=True, exist_ok=True)
             chunk_pdf_pat = re.compile(
