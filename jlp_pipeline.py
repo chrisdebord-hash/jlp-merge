@@ -2055,28 +2055,50 @@ def phase_assemble(args):
         print(f"No merged MXLs found in: {MERGED_DIR}")
         return
 
+    state           = load_state()
+    assembled_state = state.setdefault("assembled", {})
+    reassemble_cue  = args.reassemble.upper() if getattr(args, "reassemble", None) else None
+
     assembled_count = 0
     skipped_count   = 0
 
     print(f"\nAssembling {MERGED_DIR} → {ASSEMBLED_DIR}\n")
 
     for (cue, title), inst_files in sorted(cue_groups.items()):
-        out_path = ASSEMBLED_DIR / f"JLP.{cue}.{title}.full.mxl"
-
-        if out_path.exists() and not args.force:
-            print(f"── cue {cue}  skipped ({out_path.name} already exists)")
-            skipped_count += 1
-            continue
-
+        out_path  = ASSEMBLED_DIR / f"JLP.{cue}.{title}.full.mxl"
         inst_list = [i for i, _ in inst_files]
-        missing   = [i for i in INSTRUMENTS if i not in inst_list]
-        if missing and not args.force:
+
+        # ── Skip / reassemble decision ────────────────────────────────────────
+        is_reassemble_target = (reassemble_cue is not None and cue == reassemble_cue)
+        prev_record  = assembled_state.get(cue, {})
+        prev_insts   = sorted(prev_record.get("instruments", []))
+        curr_insts   = sorted(inst_list)
+        count_changed = (curr_insts != prev_insts)
+
+        if not is_reassemble_target:
+            if out_path.exists() and not count_changed:
+                print(f"── cue {cue}  skipped ({out_path.name} already exists, "
+                      f"instruments unchanged)")
+                skipped_count += 1
+                continue
+
+        # Missing instruments: skip partial assemblies unless --force or targeted
+        missing = [i for i in INSTRUMENTS if i not in inst_list]
+        if missing and not args.force and not is_reassemble_target:
             print(f"── cue {cue}  skipped "
                   f"(missing {len(missing)} instrument(s): {', '.join(missing)})")
             print(f"      Use --force to assemble with available instruments only.")
             skipped_count += 1
             continue
-        print(f"── cue {cue}  ({len(inst_files)} instrument(s): {', '.join(inst_list)})")
+
+        # Announce what triggered this assembly
+        note = ""
+        if is_reassemble_target:
+            note = "  [--reassemble]"
+        elif count_changed and out_path.exists():
+            note = (f"  [instruments changed: {len(prev_insts)} → {len(curr_insts)}]")
+        print(f"── cue {cue}  ({len(inst_files)} instrument(s): "
+              f"{', '.join(inst_list)}){note}")
 
         loaded = []
         error  = False
@@ -2118,6 +2140,21 @@ def phase_assemble(args):
 
         size = write_mxl(ET.ElementTree(score), out_path)
         print(f"   → {out_path.name}  ({max_m} measures, {size:,} bytes)")
+
+        # Persist which instruments went into this assembly
+        assembled_state[cue] = {
+            "instruments": sorted(inst_list),
+            "count":       len(inst_list),
+        }
+        save_state(state)
+
+        # Move source MXLs to trash/merged/ so merged/ stays clean
+        TRASH_MERGED_DIR.mkdir(parents=True, exist_ok=True)
+        for _inst, mxl_path in inst_files:
+            if mxl_path.exists():
+                shutil.move(str(mxl_path), str(TRASH_MERGED_DIR / mxl_path.name))
+                print(f"   Moved to trash/merged/: {mxl_path.name}")
+
         assembled_count += 1
         print()
 
@@ -2748,7 +2785,10 @@ phases:
     p.add_argument("--instrument", default=None, choices=INSTRUMENTS,
                    help="Filter to one instrument")
     p.add_argument("--force", action="store_true",
-                   help="Re-process even if output already exists / result cached")
+                   help="assemble: bypass missing-instrument check (allow partial scores); "
+                        "other phases: re-process even if output already exists / result cached")
+    p.add_argument("--reassemble", default=None, metavar="CUE",
+                   help="assemble: force reassembly of a specific cue, e.g. --reassemble 01A")
     p.add_argument("--mark-complete", nargs="+", default=[], metavar="INST:CUE",
                    help="Force inst:cue pairs complete, e.g. bass:01 violin:01")
     p.add_argument("--clear-cache", default=None, metavar="INST:CUE|all",
