@@ -1482,14 +1482,16 @@ def phase_check(args):
             print(
                 f"\n[warning] {inst} cue {cue}: PlayScore has exported the same content "
                 f"twice in a row without advancing page coverage. PlayScore may have hit "
-                f"its recognition limit on this chunk. Options:\n"
+                f"its recognition limit on this chunk.\n"
+                f"   Generating the next chunk PDF for the remaining pages.\n"
+                f"   Options for the next import:\n"
                 f"   a) Try importing a smaller chunk (1-2 pages at a time)\n"
                 f"   b) Mark as complete if you believe all music is captured: "
                 f"--mark-complete {inst}:{cue}\n"
                 f"   c) Skip for now and continue with other instruments"
             )
-            print()
-            continue
+            # Fall through to Step 6 — generate the chunk PDF so the user has
+            # it ready to try, even when loop detection fires.
 
         # ── Step 6: Determine chunk start page and generate chunk PDF ────────
         # from_page_0: 0-indexed source page where the new chunk starts.
