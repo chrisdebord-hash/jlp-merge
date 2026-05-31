@@ -629,9 +629,101 @@ def inject_tempo(part_el, measure_number: int, bpm: int):
 # MusicXML I/O
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _repair_xml(raw: bytes, filename: str) -> "bytes | None":
+    """
+    Repair common PlayScore XML corruption: a <time> element whose opening tag
+    is missing, leaving orphaned <beats>/<beat-type> tags and an unmatched
+    </time> closing tag (which causes ET.parse to raise ParseError).
+
+    Algorithm (line-by-line):
+    1. When a <beats> line is found that is NOT already inside an open <time>
+       (i.e. the preceding non-blank result line and the current line do not
+       contain <time>), treat it as an orphaned block.
+    2. Collect the block: this line plus any directly following <beat-type>
+       lines.
+    3. Look ahead past optional blank lines for an orphaned </time> — if found,
+       consume it as the block's closing tag (avoids a duplicate </time>).
+       If not found, synthesise a closing </time>.
+    4. Emit: <time> opening + block lines + </time>.
+
+    Returns repaired bytes when at least one fix was applied, else None.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1", errors="replace")
+
+    lines    = text.splitlines(keepends=True)
+    result: list = []
+    i        = 0
+    modified = False
+
+    while i < len(lines):
+        line = lines[i]
+
+        if re.search(r"<beats\b", line):
+            # Already inside <time> if <time> appears before <beats> on this line
+            beats_pos = re.search(r"<beats\b", line).start()
+            if re.search(r"<time\b", line[:beats_pos]):
+                result.append(line)
+                i += 1
+                continue
+
+            # Check the last non-blank result line for an open <time>
+            j = len(result) - 1
+            while j >= 0 and not result[j].strip():
+                j -= 1
+            prev = result[j].strip() if j >= 0 else ""
+
+            if not re.search(r"<time\b", prev):
+                indent = " " * (len(line) - len(line.lstrip()))
+
+                # Collect <beats> and any following <beat-type> lines
+                block = [line]
+                i += 1
+                while i < len(lines) and re.search(r"<beats\b|<beat-type\b", lines[i]):
+                    block.append(lines[i])
+                    i += 1
+
+                # Look ahead for an orphaned </time> (possibly after blanks)
+                look      = i
+                gap_lines = []
+                while look < len(lines) and not lines[look].strip():
+                    gap_lines.append(lines[look])
+                    look += 1
+                if look < len(lines) and re.search(r"</time\b", lines[look]):
+                    # Orphaned </time> found — use it as the closing tag and
+                    # skip it from further processing so it isn't emitted twice.
+                    close_line = lines[look]
+                    i = look + 1
+                else:
+                    close_line = f"{indent}</time>\n"
+                    # gap_lines go back into the stream normally
+                    gap_lines  = []
+
+                result.append(f"{indent}<time>\n")
+                result.extend(block)
+                result.extend(gap_lines)
+                result.append(close_line)
+                modified = True
+                continue
+
+        result.append(line)
+        i += 1
+
+    return "".join(result).encode("utf-8") if modified else None
+
+
 def load_xml(path) -> ET.ElementTree:
-    """Parse a plain .xml or compressed .mxl file."""
-    p = str(path)
+    """
+    Parse a plain .xml or compressed .mxl file.
+    On ParseError in a plain .xml, attempts automatic repair of the common
+    PlayScore corruption where <beats>/<beat-type> tags lack a <time> wrapper.
+    Raises ValueError if the file cannot be parsed even after repair.
+    """
+    p    = str(path)
+    name = Path(p).name
+
     if p.lower().endswith(".mxl"):
         with zipfile.ZipFile(p) as zf:
             root_entry = None
@@ -644,14 +736,29 @@ def load_xml(path) -> ET.ElementTree:
             except (KeyError, ET.ParseError):
                 pass
             if root_entry is None:
-                for name in zf.namelist():
-                    if name.endswith(".xml") and "META-INF" not in name:
-                        root_entry = name
+                for n in zf.namelist():
+                    if n.endswith(".xml") and "META-INF" not in n:
+                        root_entry = n
                         break
             if root_entry is None:
                 raise ValueError(f"No MusicXML content in {p}")
             return ET.parse(io.BytesIO(zf.read(root_entry)))
-    return ET.parse(p)
+
+    # Plain .xml — try direct parse, then repair on failure
+    raw = Path(p).read_bytes()
+    try:
+        return ET.parse(io.BytesIO(raw))
+    except ET.ParseError:
+        repaired = _repair_xml(raw, name)
+        if repaired is not None:
+            try:
+                tree = ET.parse(io.BytesIO(repaired))
+                print(f"   [repaired] XML parse error in {name} — "
+                      f"auto-fixed malformed <time> element")
+                return tree
+            except ET.ParseError:
+                pass
+        raise ValueError(f"XML parse error in {name} (repair failed)")
 
 
 def write_mxl(tree: ET.ElementTree, output_path) -> int:
@@ -749,8 +856,10 @@ def _make_rest_measure(number: int, beats: int, beat_type: int, divisions: int):
 
 
 def last_measure_number(xml_path: Path) -> int:
-    """Return the highest measure/@number in the file."""
-    root = ET.parse(str(xml_path)).getroot()
+    """Return the highest measure/@number in the file.
+    Uses load_xml so corrupt files are auto-repaired before parsing.
+    Raises ValueError if the file cannot be read or contains no measures."""
+    root = load_xml(xml_path).getroot()
     nums = []
     for m in root.iter("measure"):
         raw = (m.get("number") or "").strip()
