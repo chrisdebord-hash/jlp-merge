@@ -1212,18 +1212,21 @@ def phase_check(args):
         print(f"   Source PDF : {pdf_path.name}")
 
         # ── Step 1: Get total pages (no OCR needed) ──────────────────────────
-        if (
-            not args.force
-            and cached.get("pdf_path") == str(pdf_path)
-            and "total_pages" in cached
-        ):
-            total_pages = cached["total_pages"]
-        else:
-            doc = fitz.open(str(pdf_path))
-            total_pages = _last_music_page_0(doc, pdf_path.name) + 1
-            doc.close()
-            cached["pdf_path"]    = str(pdf_path)
-            cached["total_pages"] = total_pages
+        # Always run the V.S. last-page check so that state reflects the true
+        # music-only page count even when the PDF was cached before V.S.
+        # detection was added.  Saving only when the value actually changes
+        # keeps disk writes minimal.
+        doc         = fitz.open(str(pdf_path))
+        total_pages = _last_music_page_0(doc, pdf_path.name) + 1
+        has_vs_last = (total_pages < len(doc))
+        doc.close()
+        if (args.force
+                or cached.get("pdf_path") != str(pdf_path)
+                or cached.get("total_pages") != total_pages
+                or cached.get("vs_last_page") != has_vs_last):
+            cached["pdf_path"]     = str(pdf_path)
+            cached["total_pages"]  = total_pages
+            cached["vs_last_page"] = has_vs_last
             save_state(state)
         print(f"   Total pages: {total_pages}")
 
@@ -1403,6 +1406,18 @@ def phase_check(args):
         # AND page coverage has not advanced since last run.
         coverage_advanced = set(covered) > prev_covered
         if prev_seen is not None and prev_seen == latest_path.name and not coverage_advanced:
+            # If the source PDF has a V.S. last page, the stall is expected:
+            # PlayScore finished the music pages and stopped before the
+            # navigation page.  Mark complete without asking.
+            if cached.get("vs_last_page"):
+                print(f"   ✓ Complete — export stalled at V.S. last page (no music there). "
+                      f"Ready to merge.")
+                cached["complete"] = True
+                save_state(state)
+                complete_entries.append(f"{inst} cue {cue}")
+                print()
+                continue
+
             try:
                 last_m_loop = last_measure_number(latest_path)
             except Exception:
