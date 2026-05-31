@@ -1814,9 +1814,6 @@ def phase_merge(args):
         d.mkdir(parents=True, exist_ok=True)
 
     groups = group_raw_xmls(RAW_DIR, filter_inst=args.instrument, filter_cue=args.cue)
-    if not groups:
-        print(f"No JLP-named XML files found in: {RAW_DIR}")
-        return
 
     state     = load_state()
     punchlist = load_punchlist()
@@ -1825,9 +1822,12 @@ def phase_merge(args):
     merged_count  = 0
     skipped_count = 0
 
-    print(f"\nMerging {RAW_DIR} → {MERGED_DIR}\n")
+    if not groups:
+        print(f"No JLP-named XML files found in: {RAW_DIR}")
+    else:
+        print(f"\nMerging {RAW_DIR} → {MERGED_DIR}\n")
 
-    for (inst, cue, title), parts in sorted(groups.items()):
+    for (inst, cue, title), parts in sorted(groups.items()):  # empty when groups == {}
         out_path = MERGED_DIR / f"JLP.{inst}.{cue}.{title}.mxl"
 
         if out_path.exists() and not args.force:
@@ -1879,11 +1879,11 @@ def phase_merge(args):
                           file=sys.stderr)
                     continue
                 dest = TRASH_DIR / xml_path.name
+                print(f"   Moving to trash/: {xml_path.name}")
                 try:
                     shutil.move(str(xml_path), str(dest))
-                    print(f"   Moved to trash/: {xml_path.name}")
                 except (OSError, shutil.Error) as exc:
-                    print(f"   [warning] Could not move {xml_path.name} to trash/: {exc}",
+                    print(f"   [error] Move failed for {xml_path.name}: {exc}",
                           file=sys.stderr)
             # Move matching chunk PDFs from trash/ into trash/merged/
             TRASH_MERGED_DIR.mkdir(parents=True, exist_ok=True)
@@ -1945,9 +1945,40 @@ def phase_merge(args):
             save_punchlist(punchlist)
         print()
 
-    print(f"Summary: {merged_count} merged, {skipped_count} skipped")
-    if merged_count:
-        print("Run --phase assemble to build full scores.")
+    if groups:
+        print(f"Summary: {merged_count} merged, {skipped_count} skipped")
+        if merged_count:
+            print("Run --phase assemble to build full scores.")
+
+    # ── Orphan check: flag XMLs in raw/ whose cue is already merged ───────────
+    # Any JLP XML left in raw/ for a cue that has a merged MXL is a leftover
+    # from a partial run.  Report it so the user knows to re-run merge.
+    if RAW_DIR.exists() and MERGED_DIR.exists():
+        orphaned: list = []
+        try:
+            merged_names = [f.name for f in MERGED_DIR.iterdir()
+                            if f.suffix.lower() == ".mxl"]
+        except OSError:
+            merged_names = []
+        for f in sorted(RAW_DIR.iterdir()):
+            if f.suffix.lower() != ".xml":
+                continue
+            parsed = parse_xml_name(f) or parse_playscorename(f)
+            if parsed is None:
+                continue
+            p_inst, p_cue = parsed[0], parsed[1]
+            pat = re.compile(
+                r"^JLP\." + re.escape(p_inst) + r"\." + re.escape(p_cue) + r"\.",
+                re.IGNORECASE,
+            )
+            if any(pat.match(n) for n in merged_names):
+                orphaned.append(f.name)
+        if orphaned:
+            print(f"\n[warning] {len(orphaned)} XML(s) remain in raw/ for already-merged "
+                  f"cues — they were not moved to trash/:", file=sys.stderr)
+            for name in orphaned:
+                print(f"   {name}", file=sys.stderr)
+            print("   Run --phase merge again to clean them up.", file=sys.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
