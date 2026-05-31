@@ -969,6 +969,52 @@ def scan_pdf_for_measure(pdf_path: Path, measure_num: int, hint_page: int | None
     return None, total
 
 
+def _is_vs_page(page) -> bool:
+    """
+    Return True if a page appears to be a V.S. (Volti Subito) navigation-only
+    page containing no musical content.
+
+    Uses the same text-based heuristic as _is_navigation_page but applies a
+    5% ink-coverage threshold (rather than 2%) because V.S. last pages in
+    Concord Theatricals scores often carry a visible arrow graphic that pushes
+    coverage above 2% even though there is no music.
+
+    Detection order:
+    1. Text layer present → V.S./tacet pattern found AND no standalone integers
+       (measure numbers) on the same page.
+    2. No text layer → ink coverage < 5% at 72 DPI.
+    """
+    text = page.get_text("text").strip()
+    if text:
+        if _NAV_PATTERN.search(text) and not re.search(r"(?<!\d)\d{1,3}(?!\d)", text):
+            return True
+        return False
+    mat = fitz.Matrix(1.0, 1.0)
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+    non_white = sum(1 for b in pix.samples if b < 240)
+    coverage  = non_white / len(pix.samples) if pix.samples else 0
+    return coverage < 0.05
+
+
+def _last_music_page_0(doc, pdf_name: str) -> int:
+    """
+    Return the 0-indexed position of the last page in *doc* that contains
+    musical content.  If the final page is a V.S.-only navigation page it is
+    skipped and the previous page index is returned, with an [info] log line.
+    Only inspects the final page — multi-page V.S. tails are unusual.
+    """
+    last_idx = len(doc) - 1
+    if last_idx >= 1:
+        try:
+            if _is_vs_page(doc[last_idx]):
+                print(f"   [info] Last page of {pdf_name} appears to be a V.S. page — "
+                      f"using page {last_idx} as last music page.")
+                return last_idx - 1
+        except Exception:
+            pass
+    return last_idx
+
+
 def _is_navigation_page(page) -> bool:
     """
     Return True if this page carries no musical content and should be skipped
@@ -1174,7 +1220,7 @@ def phase_check(args):
             total_pages = cached["total_pages"]
         else:
             doc = fitz.open(str(pdf_path))
-            total_pages = len(doc)
+            total_pages = _last_music_page_0(doc, pdf_path.name) + 1
             doc.close()
             cached["pdf_path"]    = str(pdf_path)
             cached["total_pages"] = total_pages
@@ -1571,14 +1617,13 @@ def _piano_pdf_ocr_total(cue: str) -> "int | None":
     if piano_pdf is None:
         return None
     try:
-        doc         = fitz.open(str(piano_pdf))
-        total_pages = len(doc)
-        for back in range(min(3, total_pages)):
-            candidate = _ocr_page_max_measure(doc[-(back + 1)], full_page=(back > 0))
+        doc        = fitz.open(str(piano_pdf))
+        last_0     = _last_music_page_0(doc, piano_pdf.name)
+        for back in range(min(3, last_0 + 1)):
+            candidate = _ocr_page_max_measure(doc[last_0 - back], full_page=(back > 0))
             if candidate is not None:
                 doc.close()
-                capped = min(candidate, 400)
-                return capped
+                return min(candidate, 400)
         doc.close()
     except Exception:
         pass
