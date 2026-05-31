@@ -1044,19 +1044,22 @@ def _is_navigation_page(page) -> bool:
     return coverage < 0.02        # < 2% ink → blank or near-blank
 
 
-def extract_pages_fixed(src_path: Path, from_page_0: int, output_path: Path) -> int:
+def extract_pages_fixed(src_path: Path, from_page_0: int, output_path: Path,
+                        to_page_0: "int | None" = None) -> int:
     """
-    Extract pages [from_page_0 .. end] to output_path, skipping navigation/
-    marker-only pages (V.S. indicators, blank spacer pages, etc.).
+    Extract pages [from_page_0 .. to_page_0) to output_path, skipping
+    navigation/marker-only pages (V.S. indicators, blank spacer pages, etc.).
+    If to_page_0 is None the extraction runs to the end of the document.
     Pages with rotation==180 are corrected via PIL so PlayScore doesn't silently
     re-read page 1 when it encounters an upside-down page.
     Returns the number of music pages written (0 if only nav pages remained).
     """
     src   = fitz.open(str(src_path))
     total = len(src)
+    end   = to_page_0 if to_page_0 is not None else total
     out   = fitz.open()
 
-    for idx in range(from_page_0, total):
+    for idx in range(from_page_0, end):
         src_page = src[idx]
         if _is_navigation_page(src_page):
             print(f"   (skipping navigation/marker page {idx + 1}/{total})")
@@ -1359,8 +1362,27 @@ def phase_check(args):
                         new_parts.append({"filename": fname, "pages": [1]})
                         prev_end = 1
             else:
-                # Suffix XML: use the scan result if it lands past where the
-                # previous XML ended; otherwise assume it covers all remaining pages.
+                # Suffix XML: check the per-suffix pending_chunks dict first (written
+                # when a sub-chunk split occurs), then the legacy singular pending_chunk,
+                # then fall back to scan-based inference.
+                pending_multi  = cached.get("pending_chunks", {})
+                pending_single = cached.get("pending_chunk",  {})
+                if (not args.force
+                        and xml_suffix in pending_multi
+                        and pending_multi[xml_suffix].get("pages")):
+                    xml_pages = list(pending_multi[xml_suffix]["pages"])
+                    prev_end  = max(xml_pages)
+                    new_parts.append({"filename": fname, "pages": xml_pages})
+                    continue
+                if (not args.force
+                        and pending_single.get("suffix") == xml_suffix
+                        and pending_single.get("pages")):
+                    xml_pages = list(pending_single["pages"])
+                    prev_end  = max(xml_pages)
+                    new_parts.append({"filename": fname, "pages": xml_pages})
+                    continue
+
+                # No pending record — use scan result if it lands past prev_end.
                 if page_0 is not None and (page_0 + 1) > prev_end:
                     xml_pages = list(range(prev_end + 1, page_0 + 2))
                     prev_end  = page_0 + 1
@@ -1520,9 +1542,35 @@ def phase_check(args):
             print()
             continue
 
-        n_pages = extract_pages_fixed(pdf_path, from_page_0, chunk_path)
+        # ── Split remaining pages into ≤5-page sub-chunks ────────────────────
+        # PlayScore on iPhone cannot reliably process files longer than 5 pages.
+        # Generate all sub-chunks in one pass so the user can import them in a
+        # single session without re-running check between each one.
+        MAX_CHUNK_PAGES    = 5
+        pending_multi_dict: dict = {}
+        generated:          list = []   # (path, pages_1based, n_music, suffix)
+        cur_from = from_page_0
+        cur_suf  = next_suf
 
-        if n_pages == 0:
+        while cur_from < total_pages:
+            sub_to   = min(cur_from + MAX_CHUNK_PAGES, total_pages)
+            sub_name = f"JLP.{inst}.{cue}.{title}.{cur_suf}.pdf"
+            sub_path = NEXT_DIR / sub_name
+            sub_pages = list(range(cur_from + 1, sub_to + 1))
+
+            n = extract_pages_fixed(pdf_path, cur_from, sub_path, to_page_0=sub_to)
+            if n > 0:
+                pending_multi_dict[cur_suf] = {
+                    "suffix":   cur_suf,
+                    "pages":    sub_pages,
+                    "pdf_name": sub_name,
+                }
+                generated.append((sub_path, sub_pages, n, cur_suf))
+
+            cur_from = sub_to
+            cur_suf  = next_suffix(cur_suf)
+
+        if not generated:
             print(f"   ✓ Complete — remaining pages are navigation markers only. Ready to merge.")
             cached["complete"] = True
             save_state(state)
@@ -1541,21 +1589,34 @@ def phase_check(args):
                 shutil.move(str(consumed_pdf), str(TRASH_DIR / consumed_name))
                 print(f"   Moved to trash/: {consumed_name}")
 
-        # Record which source pages this new chunk covers so that when the
-        # corresponding XML arrives we can mark those pages as covered.
-        chunk_pages = list(range(from_page_0 + 1, total_pages + 1))
+        # Persist page-coverage info for every generated sub-chunk so that when
+        # each XML arrives the coverage can be determined without re-scanning.
+        cached["pending_chunks"] = pending_multi_dict
+        # Keep the singular form pointing to the first sub-chunk for backward
+        # compatibility with any cached state from earlier pipeline versions.
+        first_entry = generated[0]
         cached["pending_chunk"] = {
-            "suffix":   next_suf,
-            "pages":    chunk_pages,
-            "pdf_name": chunk_name,
+            "suffix":   first_entry[3],
+            "pages":    first_entry[1],
+            "pdf_name": first_entry[0].name,
         }
         save_state(state)
 
-        ps_name = chunk_path.stem.replace(".", "") + ".xml"
-        print(f"   → Chunk PDF : {chunk_path.name}")
-        print(f"      Pages {from_page_0 + 1}–{total_pages} ({n_pages} page(s))")
-        print(f"      PlayScore will name the export: {ps_name}")
-        chunk_pdfs.append(chunk_path)
+        if len(generated) == 1:
+            sub_path, sub_pages, n, suf = generated[0]
+            ps_name = sub_path.stem.replace(".", "") + ".xml"
+            print(f"   → Chunk PDF : {sub_path.name}")
+            print(f"      Pages {sub_pages[0]}–{sub_pages[-1]} ({n} page(s))")
+            print(f"      PlayScore will name the export: {ps_name}")
+        else:
+            print(f"   → {len(generated)} chunk PDFs (≤{MAX_CHUNK_PAGES} pages each):")
+            for sub_path, sub_pages, n, suf in generated:
+                ps_name = sub_path.stem.replace(".", "") + ".xml"
+                print(f"      {sub_path.name}  pages {sub_pages[0]}–{sub_pages[-1]} ({n} page(s))")
+                print(f"         PlayScore export: {ps_name}")
+
+        for sub_path, sub_pages, n, suf in generated:
+            chunk_pdfs.append(sub_path)
         print()
 
     # ── Actionable summary ────────────────────────────────────────────────────
