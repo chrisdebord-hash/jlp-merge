@@ -40,7 +40,7 @@ import argparse
 import numpy as np
 import fitz
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 SRC_DIR = Path("/Users/chrisdebord/Library/Mobile Documents/com~apple~CloudDocs"
@@ -458,20 +458,16 @@ def find_piano_pairs(
 
 # ── Per-page processing ───────────────────────────────────────────────────────
 
-def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
+def detect_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
     """
-    Analyse a PDF page and return the cropped piano-only image as a PIL Image.
+    Run the full detection pipeline for one page.
 
-    Returns
-    -------
-    pil_out      : PIL.Image  — the (possibly cropped) page image
-    removed_pct  : float      — percentage of page height removed
-    warnings     : list[str]
-    n_systems    : int
-    piano_only   : bool       — True when no vocal staves were detected
+    Returns (img, (x0, x1), staves, regions, n_systems, piano_only) where img is
+    the detection-DPI grayscale render, staves are individual (top, bot) bands,
+    and regions are the kept piano (top, bot) crop bands in detection-DPI rows.
+    Shared by process_page (output) and the QC contact sheet so both report
+    exactly the same kept regions.
     """
-    warnings: list[str] = []
-
     # Staff detection (continuous-run detector — see staff_detect_v2 docstring).
     # detect_staves renders/normalizes/finds-x-bounds internally at the detection
     # DPI and hands back clean individual staves, replacing the old two-pass
@@ -479,21 +475,10 @@ def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
     # import avoids a circular import (staff_detect_v2 imports this module).
     import staff_detect_v2
     img, (x0, x1), staves = staff_detect_v2.detect_staves(page, dpi)
-    H, W = img.shape
     norm = normalize_contrast(img)
 
-    # Output is rendered fresh at OUTPUT_DPI; detection coordinates (200 DPI)
-    # are scaled to it by this ratio.  Keeping the page whole means re-rendering
-    # the full page at OUTPUT_DPI so even pass-through pages are crisp.
-    out_dpi = OUTPUT_DPI
-    scale   = out_dpi / dpi
-
-    def _whole_page():
-        return Image.fromarray(render_gray(page, out_dpi), mode='L')
-
     if len(staves) < 2:
-        warnings.append(f"Only {len(staves)} stave(s) detected — keeping full page")
-        return _whole_page(), 0.0, warnings, 0, True
+        return img, (x0, x1), staves, [], 0, True
 
     # Primary: bass-clef detection via measure-number signal.
     # Bass clef staves are local minima in the "dark pixels just below the stave"
@@ -514,7 +499,39 @@ def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
         n_systems  = len(systems)
         max_staves = max(len(s) for s in systems) if systems else 0
         piano_only = (max_staves <= 2)
-        regions    = piano_regions(systems, H)
+        regions    = piano_regions(systems, img.shape[0])
+
+    return img, (x0, x1), staves, regions, n_systems, piano_only
+
+
+def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
+    """
+    Analyse a PDF page and return the cropped piano-only image as a PIL Image.
+
+    Returns
+    -------
+    pil_out      : PIL.Image  — the (possibly cropped) page image
+    removed_pct  : float      — percentage of page height removed
+    warnings     : list[str]
+    n_systems    : int
+    piano_only   : bool       — True when no vocal staves were detected
+    """
+    warnings: list[str] = []
+
+    img, (x0, x1), staves, regions, n_systems, piano_only = detect_page(page, dpi)
+
+    # Output is rendered fresh at OUTPUT_DPI; detection coordinates (200 DPI)
+    # are scaled to it by this ratio.  Keeping the page whole means re-rendering
+    # the full page at OUTPUT_DPI so even pass-through pages are crisp.
+    out_dpi = OUTPUT_DPI
+    scale   = out_dpi / dpi
+
+    def _whole_page():
+        return Image.fromarray(render_gray(page, out_dpi), mode='L')
+
+    if len(staves) < 2:
+        warnings.append(f"Only {len(staves)} stave(s) detected — keeping full page")
+        return _whole_page(), 0.0, warnings, 0, True
 
     if not regions:
         warnings.append("No piano regions determined — keeping full page")
@@ -542,6 +559,84 @@ def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
 
     removed_pct = (1.0 - kept_rows / oH) * 100.0
     return Image.fromarray(redacted, mode='L'), removed_pct, warnings, n_systems, piano_only
+
+
+# ── QC contact sheet ──────────────────────────────────────────────────────────
+
+BLOB_H_PX = 120   # a stave taller than this at detection DPI is a detection-failure "blob"
+
+
+def page_anomalies(staves: list[tuple[int, int]],
+                   regions: list[tuple[int, int]]) -> list[str]:
+    """
+    Flag detection problems on one page (coordinates at detection DPI):
+      • '0-staves'    — nothing detected (skewed scan or title page)
+      • 'blob'        — a merged stave taller than BLOB_H_PX (detection failure)
+      • 'fat-region'  — a kept region enclosing >2 staves, i.e. a vocal stave
+                        slipped into the piano crop (proxy for visual check (c))
+    """
+    out: list[str] = []
+    if len(staves) == 0:
+        out.append("0-staves")
+    tall = [b - t for t, b in staves if (b - t) > BLOB_H_PX]
+    if tall:
+        out.append(f"blob(maxH={max(tall)})")
+    for rt, rb in regions:
+        enclosed = sum(1 for t, b in staves if t >= rt - 2 and b <= rb + 2)
+        if enclosed > 2:
+            out.append(f"fat-region({enclosed}-staves)")
+    return out
+
+
+def qc_contact_sheet(src: Path, out_png: Path, dpi: int = ANALYSIS_DPI,
+                     thumb_w: int = 380, cols: int = 4) -> list[tuple[int, list[str]]]:
+    """
+    Render every page of `src` as a thumbnail in a grid, drawing detected staves
+    in blue and kept piano regions in red, and write one PNG to `out_png`.
+
+    Returns a list of (page_index, anomalies) for pages with any anomaly, so the
+    batch runner can report problems without re-detecting.
+    """
+    doc = fitz.open(str(src))
+    thumbs: list[Image.Image] = []
+    found: list[tuple[int, list[str]]] = []
+
+    for i in range(len(doc)):
+        img, (x0, x1), staves, regions, _, _ = detect_page(doc[i], dpi)
+        H, W = img.shape
+        sc = thumb_w / W
+        th = max(int(H * sc), 1)
+        t = Image.fromarray(img, mode='L').convert('RGB').resize((thumb_w, th))
+        d = ImageDraw.Draw(t)
+        xa, xb = x0 * sc, x1 * sc
+        for s_t, s_b in staves:                       # detected staves → blue
+            d.rectangle([xa, s_t * sc, xb, s_b * sc], outline=(0, 90, 255), width=1)
+        for r_t, r_b in regions:                      # kept piano regions → red
+            d.rectangle([xa, r_t * sc, xb, r_b * sc], outline=(225, 0, 0), width=2)
+
+        anom = page_anomalies(staves, regions)
+        if anom:
+            found.append((i, anom))
+        label = f"p{i}  staves={len(staves)} regions={len(regions)}"
+        if anom:
+            label += "  !" + ",".join(anom)
+        d.rectangle([0, 0, thumb_w - 1, 14], fill=(0, 0, 0))
+        d.text((3, 3), label, fill=(255, 100, 100) if anom else (120, 255, 120))
+        thumbs.append(t)
+    doc.close()
+
+    if not thumbs:
+        return found
+    cell_w = thumb_w + 8
+    cell_h = max(t.height for t in thumbs) + 8
+    rows = (len(thumbs) + cols - 1) // cols
+    sheet = Image.new('RGB', (cols * cell_w, rows * cell_h), (235, 235, 235))
+    for idx, t in enumerate(thumbs):
+        r, c = divmod(idx, cols)
+        sheet.paste(t, (c * cell_w + 4, r * cell_h + 4))
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(str(out_png))
+    return found
 
 
 # ── File-level processing ─────────────────────────────────────────────────────
@@ -615,15 +710,36 @@ def main() -> None:
     ap.add_argument("--preview", default="/tmp/overture_cropped_preview.png",
                     metavar="PATH",
                     help="Path for the page-1 preview PNG (test mode only)")
+    ap.add_argument("--qc", action="store_true",
+                    help="QC mode: write one contact-sheet PNG per cue to "
+                         "--qc-dir (staves in blue, kept regions in red) and "
+                         "report anomalies. Does NOT write cropped PDFs.")
+    ap.add_argument("--qc-dir", default="/tmp/qc", metavar="DIR",
+                    help="Directory for QC contact sheets (default /tmp/qc)")
     args = ap.parse_args()
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.test:
         files = [SRC_DIR / "JLP.piano.00.OVERTURE.pdf"]
     else:
         files = sorted(SRC_DIR.glob("*.pdf"))
 
+    if args.qc:
+        qc_dir = Path(args.qc_dir)
+        qc_dir.mkdir(parents=True, exist_ok=True)
+        total_anom = 0
+        for src in files:
+            cue = src.stem
+            out_png = qc_dir / f"{cue}.png"
+            anomalies = qc_contact_sheet(src, out_png)
+            tag = "" if not anomalies else \
+                "  ⚠ " + "; ".join(f"p{p}:{','.join(a)}" for p, a in anomalies)
+            total_anom += len(anomalies)
+            print(f"QC: {cue}.png{tag}")
+        print(f"\nDone — {len(files)} contact sheets in {qc_dir}. "
+              f"{total_anom} page(s) flagged.")
+        return
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     ok = 0
     for src in files:
         out     = OUT_DIR / src.name
