@@ -464,38 +464,15 @@ def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
     """
     warnings: list[str] = []
 
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+    # Staff detection (continuous-run detector — see staff_detect_v2 docstring).
+    # detect_staves renders/normalizes/finds-x-bounds internally at the detection
+    # DPI and hands back clean individual staves, replacing the old two-pass
+    # strip-density block that merged dense systems into single blobs.  Lazy
+    # import avoids a circular import (staff_detect_v2 imports this module).
+    import staff_detect_v2
+    img, (x0, x1), staves = staff_detect_v2.detect_staves(page, dpi)
     H, W = img.shape
-
-    # Normalize then find score x extent
-    norm    = normalize_contrast(img)
-    x0, x1 = find_score_x_bounds(norm)
-
-    # Two-pass staff detection: run both levels of strictness and keep whichever
-    # finds more staves.  The strict pass (run_div=4) is preferred when it
-    # finds enough staves (≥ 4); the loose pass (run_div=8) rescues pages where
-    # dense notation breaks the minimum-run criterion for most stave lines.
-    best_staves: list[tuple[int, int]] = []
-    for run_div in (4, 8):
-        density  = compute_strip_density(norm, x0, x1, min_run_divisor=run_div)
-        clusters = find_clusters(density, H)
-        s        = group_into_staves(clusters)
-        if len(s) > len(best_staves):
-            best_staves = s
-        if len(best_staves) >= 4:
-            break  # strict pass already found enough; no need to loosen
-
-    staves = best_staves
-
-    # Filter out implausible stave detections before any pairing or system logic:
-    #  • Too short (< MIN_STAVE_H_PX): spurious horizontal elements — glissando lines,
-    #    diagonal arrows, thin barline fragments, etc.
-    #  • Too tall  (> MAX_STAVE_H_PX): multiple staves merged into one giant cluster,
-    #    which breaks both the pairing and the system-detection logic.
-    staves = [(t, b) for t, b in staves
-              if MIN_STAVE_H_PX <= (b - t) <= MAX_STAVE_H_PX]
+    norm = normalize_contrast(img)
 
     if len(staves) < 2:
         warnings.append(f"Only {len(staves)} stave(s) detected — keeping full page")
