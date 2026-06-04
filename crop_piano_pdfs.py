@@ -49,7 +49,8 @@ OUT_DIR = Path("/Users/chrisdebord/Library/Mobile Documents/com~apple~CloudDocs"
                "/FYL/Jagged Little Pill/scores/piano_cropped")
 
 # ── Parameters ────────────────────────────────────────────────────────────────
-ANALYSIS_DPI  = 200   # DPI used for analysis AND for building output images
+ANALYSIS_DPI  = 200   # DPI used for staff detection (find_piano_pairs windows are tuned for it)
+OUTPUT_DPI    = 300   # DPI for the exported page; scans are ~600, 300 is crisp for PlayScore OMR
 N_STRIPS      = 24    # number of equal-width horizontal strips for staff detection
 MIN_STRIP_FRAC = 0.42 # fraction of strips that must be dark for a "staff row"
 CLUSTER_GAP   = 8     # max pixel gap to merge adjacent rows into one cluster
@@ -72,6 +73,13 @@ MIN_PAGE_HEIGHT_PT  = 300  # minimum output page height in points; shorter pages
 
 
 # ── Image utilities ───────────────────────────────────────────────────────────
+
+def render_gray(page: fitz.Page, dpi: int) -> np.ndarray:
+    """Render a page to a grayscale numpy array at the given DPI."""
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+
 
 def normalize_contrast(img: np.ndarray) -> np.ndarray:
     """Stretch the 1st–99th percentile of pixel values to the 0–255 range."""
@@ -474,9 +482,18 @@ def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
     H, W = img.shape
     norm = normalize_contrast(img)
 
+    # Output is rendered fresh at OUTPUT_DPI; detection coordinates (200 DPI)
+    # are scaled to it by this ratio.  Keeping the page whole means re-rendering
+    # the full page at OUTPUT_DPI so even pass-through pages are crisp.
+    out_dpi = OUTPUT_DPI
+    scale   = out_dpi / dpi
+
+    def _whole_page():
+        return Image.fromarray(render_gray(page, out_dpi), mode='L')
+
     if len(staves) < 2:
         warnings.append(f"Only {len(staves)} stave(s) detected — keeping full page")
-        return Image.fromarray(img, mode='L'), 0.0, warnings, 0, True
+        return _whole_page(), 0.0, warnings, 0, True
 
     # Primary: bass-clef detection via measure-number signal.
     # Bass clef staves are local minima in the "dark pixels just below the stave"
@@ -501,25 +518,30 @@ def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
 
     if not regions:
         warnings.append("No piano regions determined — keeping full page")
-        return Image.fromarray(img, mode='L'), 0.0, warnings, 0, True
+        return _whole_page(), 0.0, warnings, 0, True
 
-    strips = [img[t:b + 1, :] for t, b in regions if b > t]
-    if not strips:
-        warnings.append("All crop strips were empty — keeping full page")
-        return Image.fromarray(img, mode='L'), 0.0, warnings, 0, True
+    # Build the output by REDACTING the vocal bands to white on a high-DPI
+    # render of the page, instead of stacking down-rastered strips.  The page
+    # geometry (and therefore measure alignment) is preserved, and the kept
+    # piano grand staves stay at their native scan resolution — crisper notation
+    # for PlayScore.  Detection regions (200 DPI rows) are scaled to OUTPUT_DPI.
+    out_img = render_gray(page, out_dpi)
+    oH, oW  = out_img.shape
+    redacted = np.full_like(out_img, 255)          # start all-white
+    kept_rows = 0
+    for t, b in regions:
+        ot = max(int(round(t * scale)), 0)
+        ob = min(int(round((b + 1) * scale)), oH)
+        if ob > ot:
+            redacted[ot:ob, :] = out_img[ot:ob, :]  # copy piano band through
+            kept_rows += ob - ot
 
-    # Insert white rows between systems so PlayScore can distinguish them
-    GAP_PX = 80
-    gap = np.full((GAP_PX, img.shape[1]), 255, dtype=np.uint8)
-    interleaved = []
-    for i, s in enumerate(strips):
-        if i > 0:
-            interleaved.append(gap)
-        interleaved.append(s)
-    cropped     = np.vstack(interleaved)
-    removed_pct = (1.0 - cropped.shape[0] / H) * 100.0
+    if kept_rows == 0:
+        warnings.append("All crop regions were empty — keeping full page")
+        return _whole_page(), 0.0, warnings, 0, True
 
-    return Image.fromarray(cropped, mode='L'), removed_pct, warnings, n_systems, piano_only
+    removed_pct = (1.0 - kept_rows / oH) * 100.0
+    return Image.fromarray(redacted, mode='L'), removed_pct, warnings, n_systems, piano_only
 
 
 # ── File-level processing ─────────────────────────────────────────────────────
@@ -553,15 +575,17 @@ def process_file(src: Path, out: Path, dpi: int = ANALYSIS_DPI,
         # Short cues (01A, 02A, etc.) and pages where detection produced a tiny
         # sliver both end up well below PlayScore's minimum; pad with whitespace.
         W_px, H_px = pil_out.size          # PIL: (width, height)
-        min_h_px = int(MIN_PAGE_HEIGHT_PT * dpi / 72)
+        # pil_out is rendered at OUTPUT_DPI (not the detection dpi), so convert
+        # pixels→points and size the minimum-height guard against OUTPUT_DPI.
+        min_h_px = int(MIN_PAGE_HEIGHT_PT * OUTPUT_DPI / 72)
         if H_px < min_h_px:
             padded = Image.new('L', (W_px, min_h_px), 255)
             padded.paste(pil_out, (0, 0))
             pil_out = padded
             H_px = min_h_px
 
-        W_pt = W_px * 72.0 / dpi
-        H_pt = H_px * 72.0 / dpi
+        W_pt = W_px * 72.0 / OUTPUT_DPI
+        H_pt = H_px * 72.0 / OUTPUT_DPI
         out_page = out_doc.new_page(width=W_pt, height=H_pt)
 
         buf = io.BytesIO()
