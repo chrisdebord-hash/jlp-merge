@@ -51,6 +51,7 @@ OUT_DIR = Path("/Users/chrisdebord/Library/Mobile Documents/com~apple~CloudDocs"
 # ── Parameters ────────────────────────────────────────────────────────────────
 ANALYSIS_DPI  = 200   # DPI used for staff detection (find_piano_pairs windows are tuned for it)
 OUTPUT_DPI    = 300   # DPI for the exported page; scans are ~600, 300 is crisp for PlayScore OMR
+SKEW_RETRY_STAVES = 6 # below this many detected staves, attempt the deskew rescue (see detect_page)
 N_STRIPS      = 24    # number of equal-width horizontal strips for staff detection
 MIN_STRIP_FRAC = 0.42 # fraction of strips that must be dark for a "staff row"
 CLUSTER_GAP   = 8     # max pixel gap to merge adjacent rows into one cluster
@@ -462,23 +463,41 @@ def detect_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
     """
     Run the full detection pipeline for one page.
 
-    Returns (img, (x0, x1), staves, regions, n_systems, piano_only) where img is
-    the detection-DPI grayscale render, staves are individual (top, bot) bands,
-    and regions are the kept piano (top, bot) crop bands in detection-DPI rows.
+    Returns (img, (x0, x1), staves, regions, n_systems, piano_only, angle) where
+    img is the deskewed detection-DPI render, staves are individual (top, bot)
+    bands, regions are the kept piano (top, bot) crop bands (all in detection-DPI
+    rows of the deskewed frame), and angle is the deskew rotation in degrees.
     Shared by process_page (output) and the QC contact sheet so both report
-    exactly the same kept regions.
+    exactly the same kept regions; process_page re-applies `angle` to the
+    high-DPI output render so the regions line up.
     """
     # Staff detection (continuous-run detector — see staff_detect_v2 docstring).
-    # detect_staves renders/normalizes/finds-x-bounds internally at the detection
-    # DPI and hands back clean individual staves, replacing the old two-pass
-    # strip-density block that merged dense systems into single blobs.  Lazy
-    # import avoids a circular import (staff_detect_v2 imports this module).
+    # We render here (not via detect_staves) so the SAME deskew angle drives both
+    # detection and the high-DPI output.  Lazy import avoids a circular import
+    # (staff_detect_v2 imports this module).
     import staff_detect_v2
-    img, (x0, x1), staves = staff_detect_v2.detect_staves(page, dpi)
+    img = render_gray(page, dpi)
+    (x0, x1), staves = staff_detect_v2.detect_on_image(img)
+    angle = 0.0
+
+    # Deskew rescue: a sub-degree tilt can drop a whole page to 0/blobby staves.
+    # Only pay for the angle search when angle-0 detection looks weak (few staves
+    # or a merged blob); a clearly-detected page is already horizontal.  Adopt
+    # the rotated result only if it actually finds more staves.
+    weak = len(staves) < SKEW_RETRY_STAVES or \
+        any((b - t) > BLOB_H_PX for t, b in staves)
+    if weak:
+        a = staff_detect_v2.estimate_skew_angle(img)
+        if abs(a) >= staff_detect_v2.SKEW_MIN_APPLY:
+            img2 = staff_detect_v2.deskew_image(img, a)
+            (x0b, x1b), staves2 = staff_detect_v2.detect_on_image(img2)
+            if len(staves2) > len(staves):
+                img, x0, x1, staves, angle = img2, x0b, x1b, staves2, a
+
     norm = normalize_contrast(img)
 
     if len(staves) < 2:
-        return img, (x0, x1), staves, [], 0, True
+        return img, (x0, x1), staves, [], 0, True, angle
 
     # Primary: bass-clef detection via measure-number signal.
     # Bass clef staves are local minima in the "dark pixels just below the stave"
@@ -501,7 +520,7 @@ def detect_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
         piano_only = (max_staves <= 2)
         regions    = piano_regions(systems, img.shape[0])
 
-    return img, (x0, x1), staves, regions, n_systems, piano_only
+    return img, (x0, x1), staves, regions, n_systems, piano_only, angle
 
 
 def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
@@ -518,11 +537,14 @@ def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
     """
     warnings: list[str] = []
 
-    img, (x0, x1), staves, regions, n_systems, piano_only = detect_page(page, dpi)
+    import staff_detect_v2
+    img, (x0, x1), staves, regions, n_systems, piano_only, angle = detect_page(page, dpi)
 
     # Output is rendered fresh at OUTPUT_DPI; detection coordinates (200 DPI)
     # are scaled to it by this ratio.  Keeping the page whole means re-rendering
-    # the full page at OUTPUT_DPI so even pass-through pages are crisp.
+    # the full page at OUTPUT_DPI so even pass-through pages are crisp.  Pages
+    # that pass through (no staves/regions) keep their ORIGINAL orientation —
+    # the deskew angle is only trustworthy once staves were actually detected.
     out_dpi = OUTPUT_DPI
     scale   = out_dpi / dpi
 
@@ -541,8 +563,9 @@ def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
     # render of the page, instead of stacking down-rastered strips.  The page
     # geometry (and therefore measure alignment) is preserved, and the kept
     # piano grand staves stay at their native scan resolution — crisper notation
-    # for PlayScore.  Detection regions (200 DPI rows) are scaled to OUTPUT_DPI.
-    out_img = render_gray(page, out_dpi)
+    # for PlayScore.  The output is deskewed by the SAME angle as detection so
+    # the region rows (200 DPI) scale straight to OUTPUT_DPI.
+    out_img = staff_detect_v2.deskew_image(render_gray(page, out_dpi), angle)
     oH, oW  = out_img.shape
     redacted = np.full_like(out_img, 255)          # start all-white
     kept_rows = 0
@@ -602,7 +625,7 @@ def qc_contact_sheet(src: Path, out_png: Path, dpi: int = ANALYSIS_DPI,
     found: list[tuple[int, list[str]]] = []
 
     for i in range(len(doc)):
-        img, (x0, x1), staves, regions, _, _ = detect_page(doc[i], dpi)
+        img, (x0, x1), staves, regions, _, _, _ = detect_page(doc[i], dpi)
         H, W = img.shape
         sc = thumb_w / W
         th = max(int(H * sc), 1)

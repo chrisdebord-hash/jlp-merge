@@ -61,6 +61,7 @@ import sys
 sys.path.insert(0, "/Users/chrisdebord/JLP_merge")
 import numpy as np
 import fitz
+from PIL import Image
 import crop_piano_pdfs as C
 
 DET_DPI       = 200
@@ -105,15 +106,111 @@ def _render_gray(page: fitz.Page, dpi: int):
     return img
 
 
-def detect_staves(page: fitz.Page, dpi: int = DET_DPI):
-    """Return individual staff regions [(top, bot), ...] (empty if none found)."""
-    img = _render_gray(page, dpi)
+# ── Deskew (closes the heavy-skew gap) ────────────────────────────────────────
+# A flat pixel row only crosses a tilted staff line part-way, so even a sub-degree
+# tilt drops the longest continuous run below the cutoff and detection returns 0
+# staves (e.g. All I Really Want p8/p10: max run 389px vs a 404px threshold — the
+# line drifts out of the flat row after ~350px). Fix: rotate the page so staff
+# lines are horizontal BEFORE detection.
+#
+# The angle is scored by the DETECTION METRIC ITSELF — the number of rows whose
+# longest dark run clears LINE_RUN_FRAC*width.  A plain dark-pixel-variance score
+# fails here because note/lyric content dominates the variance and peaks at 0°;
+# the staff-row count instead jumps from ~0 to >100 at the true angle (a tilted
+# line snaps to full width).  We only adopt a tilt when it CLEARLY beats the flat
+# baseline, so already-horizontal pages stay at 0° untouched.  The SAME angle is
+# re-applied to the output render so kept regions land correctly (see
+# crop_piano_pdfs.detect_page).
+SKEW_MAX_DEG       = 4.0   # search range ±deg (these scans are never worse than this)
+SKEW_MIN_APPLY     = 0.10  # don't rotate below this (avoids needless resampling)
+SKEW_MIN_GAIN_ROWS = 20    # adopt a tilt only if it adds at least this many staff-rows
+
+
+def _staffline_row_count(small: np.ndarray, angle: float) -> int:
+    """How many rows look like staff lines after rotating `small` by `angle`.
+
+    This is the same continuous-run test detection uses, so maximizing it is
+    exactly maximizing detector success.
+    """
+    if angle == 0.0:
+        rot = small
+    else:
+        rot = np.asarray(Image.fromarray(small, mode='L').rotate(
+            angle, resample=Image.BILINEAR, expand=False, fillcolor=255))
+    norm = C.normalize_contrast(rot)
+    x0, x1 = C.find_score_x_bounds(norm)
+    w = x1 - x0
+    if w < 20:
+        return 0
+    dark = norm[:, x0:x1] < DARK_THRESH
+    return int((_longest_run_rows(dark) >= LINE_RUN_FRAC * w).sum())
+
+
+def estimate_skew_angle(img: np.ndarray, max_deg: float = SKEW_MAX_DEG) -> float:
+    """Estimate the dominant staff-line tilt (deg) via coarse→fine search.
+
+    The whole search runs at FULL resolution: the staff-row peak can be as narrow
+    as ±0.2° (e.g. All I Really Want p0), and downsampling washes it out — a flat
+    row only stays inside a thin tilted line for a limited span, and that span
+    shrinks with resolution.  Cost is bounded because the caller only invokes
+    this on pages that already failed flat detection.  Returns 0.0 unless a
+    non-zero angle clearly beats the flat baseline, so already-horizontal pages
+    are never perturbed.
+    """
+    H, W = img.shape
+    if W < 40 or H < 40:
+        return 0.0
+
+    base = _staffline_row_count(img, 0.0)
+    # Coarse: 0.5° steps to bracket the tilt.
+    coarse_a, coarse_s = 0.0, base
+    for i in range(int(-max_deg * 2), int(max_deg * 2) + 1):
+        a = i * 0.5
+        if a == 0.0:
+            continue
+        s = _staffline_row_count(img, a)
+        if s > coarse_s:
+            coarse_s, coarse_a = s, a
+    if coarse_a == 0.0:
+        return 0.0          # nothing beats horizontal → page is straight
+
+    # Fine: 0.1° steps around the coarse estimate.
+    best_a, best_s = 0.0, base
+    for d in range(-6, 7):
+        a = round(coarse_a + d * 0.1, 2)
+        if abs(a) > max_deg + 0.5:
+            continue
+        s = _staffline_row_count(img, a)
+        if s > best_s:
+            best_s, best_a = s, a
+
+    # Adopt the tilt only if it clearly beats horizontal — guards good pages.
+    if best_a != 0.0 and best_s >= base + SKEW_MIN_GAIN_ROWS and best_s > base * 1.10:
+        return best_a
+    return 0.0
+
+
+def deskew_image(img: np.ndarray, angle: float) -> np.ndarray:
+    """Rotate a grayscale image by `angle` degrees (white fill, same size)."""
+    if abs(angle) < SKEW_MIN_APPLY:
+        return img
+    im = Image.fromarray(img, mode='L').rotate(
+        angle, resample=Image.BICUBIC, expand=False, fillcolor=255)
+    return np.asarray(im)
+
+
+def detect_on_image(img: np.ndarray):
+    """Core detection on an already-rendered (and deskewed) gray image.
+
+    Returns ((x0, x1), staves). Used directly by crop_piano_pdfs.detect_page so
+    it can drive deskew once and reuse the angle for the output render.
+    """
     H, W = img.shape
     norm = C.normalize_contrast(img)
     x0, x1 = C.find_score_x_bounds(norm)
     w = x1 - x0
     if w < 20:
-        return img, (x0, x1), []
+        return (x0, x1), []
     dark = norm[:, x0:x1] < DARK_THRESH
     isline = _longest_run_rows(dark) >= LINE_RUN_FRAC * w
 
@@ -126,7 +223,7 @@ def detect_staves(page: fitz.Page, dpi: int = DET_DPI):
             merged.append(b)
     lb = merged
     if len(lb) < 2:
-        return img, (x0, x1), []          # title / near-empty page → caller keeps whole page
+        return (x0, x1), []               # title / near-empty page → caller keeps whole page
 
     centers = [(t + b) // 2 for t, b in lb]
     line_sp = float(np.median(np.diff(centers))) or 1.0
@@ -140,6 +237,27 @@ def detect_staves(page: fitz.Page, dpi: int = DET_DPI):
             cur.append(lb[i])
     staves.append((cur[0][0], cur[-1][1]))
     staves = [(t, b) for t, b in staves if (b - t) >= MIN_STAVE_K * line_sp]
+    return (x0, x1), staves
+
+
+def detect_staves(page: fitz.Page, dpi: int = DET_DPI, deskew: bool = True):
+    """Render a page, deskew it if needed, and return (img, (x0,x1), staves).
+
+    img is the (possibly deskewed) detection-DPI render the staves index into.
+    Deskew is a RESCUE: only attempted when flat detection looks weak (few staves
+    or a merged blob), and adopted only if it finds more staves — mirroring
+    crop_piano_pdfs.detect_page (which additionally re-uses the angle for the
+    high-DPI output).  This wrapper is for the smoke test / standalone callers.
+    """
+    img = _render_gray(page, dpi)
+    (x0, x1), staves = detect_on_image(img)
+    if deskew and (len(staves) < 6 or any((b - t) > 120 for t, b in staves)):
+        a = estimate_skew_angle(img)
+        if abs(a) >= SKEW_MIN_APPLY:
+            img2 = deskew_image(img, a)
+            (x0b, x1b), staves2 = detect_on_image(img2)
+            if len(staves2) > len(staves):
+                img, x0, x1, staves = img2, x0b, x1b, staves2
     return img, (x0, x1), staves
 
 
