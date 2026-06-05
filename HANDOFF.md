@@ -6,10 +6,14 @@ lines. Output feeds the canned-backing-track build. Show opens **Aug 9 2026**.
 
 Two files:
 
-- `crop_piano_pdfs.py` — pipeline: detect → keep piano regions → write
-  high-res piano-only PDFs; also a QC contact-sheet mode.
+- `crop_piano_pdfs.py` — pipeline: detect staves → keep the {-**braced** piano
+  grand staves → write high-res piano-only PDFs; also a QC contact-sheet mode.
 - `staff_detect_v2.py` — the staff detector + deskew (read its module docstring
   for the detection rationale).
+
+**The piano rule (ground truth):** a piano region is a `{`-braced grand staff —
+exactly two adjacent staves joined by a brace. A region is emitted ONLY for a
+braced pair; never for an unbraced pair. See *Brace detection* below.
 
 ---
 
@@ -76,6 +80,54 @@ down-rastered strips. This preserves measure alignment and keeps the piano
 notation crisp for OMR. Detection rows (200 DPI) are scaled to the output by the
 DPI ratio.
 
+## Brace detection (the real piano rule)
+
+The old way of picking the piano — "keep the bottom two staves of each system,
+confirmed by a measure-number signal under the bass clef" (`find_piano_pairs` /
+`group_into_systems`) — **misfired**: it kept braceless pairs (Overture p6/idx5
+system 1 grabbed a vocal pair) and under-detected when a piano stave was too
+faint to detect (Overture p3/idx2 found only 1 of 2 systems). The real
+invariant is the engraving itself: the piano is the grand staff marked by a
+curved `{` **brace**, distinct from the full-system **bracket** (spans all
+staves of a system, straight) and from **barlines** (straight).
+
+`find_piano_braces` (in `crop_piano_pdfs.py`) detects the brace by its left-edge
+**cusp**:
+
+1. In a window just left of the score — `[x0-40, x0+140]`, wide enough to absorb
+   per-system **indentation** (each system can start at a different x; the brace
+   is NOT a fixed offset from the global `x0`) — take the **leftmost-ink column**
+   of every row across the candidate grand-staff rows. In the piano region the
+   brace is the leftmost vertical structure: the full-system bracket lives in the
+   vocal rows *above* the piano, never inside it.
+2. A brace makes that profile dip to its **minimum at the vertical midpoint**
+   (bulges LEFT) and sit further right at the top and bottom tips (it tapers to
+   points). A straight bracket or barline gives a flat profile. So:
+   - `taper`  = px the centre cusp sits left of the tips → **≥ 4** for a brace,
+     ~0 or negative for a bracket/barline.
+   - `argmin` = normalized row of the leftmost point → must be **central**
+     (≈0.5), i.e. the grand-staff midpoint.
+   - `cov`    = fraction of rows carrying left-edge ink → structure continuity.
+3. **Primary pass:** every adjacent stave pair whose `grandstaff_cusp` clears
+   those gates is a piano region. Unbraced pairs are dropped.
+4. **Missing-stave rescue:** when one piano stave is too faint for the staff
+   detector but the brace still proves the grand staff is there (Overture p3
+   system 2 — the bass stave's longest run is 349 px vs the 405 px staff-line
+   cutoff), an uncovered stave next to an empty gap is re-tested over an extended
+   region (one grand-staff height) with a **stricter** cusp; if it braces, the
+   region is kept. This never invents a region under a vocal stave.
+
+**Dead ends (don't retry):** plain "any ink in the gap near `x0`" (confounded by
+barlines/clefs/time-sigs); a fixed narrow band at a constant offset from the
+global `x0` (breaks on per-system indentation — e.g. HIMP p1's top system starts
+~100 px right of the page `x0`); vertical-opening the ink to isolate the brace
+(erases the cusp, which is the whole signal). The corroborating signals
+(tighter grand-staff gap, bass clef below) are NOT reliable on their own here —
+the brace is primary.
+
+`find_piano_pairs` / `group_into_systems` / `piano_regions` remain in the module
+for reference but are no longer on the detection path.
+
 ---
 
 ## Validated parameters
@@ -101,8 +153,22 @@ Pipeline (`crop_piano_pdfs.py`):
 | `SKEW_RETRY_STAVES` | 6 | below this many staves, attempt the deskew rescue |
 | `BLOB_H_PX` | 120 | stave taller than this = detection-failure blob |
 
-**Do NOT modify** `find_piano_pairs` / the bass-clef-via-measure-number logic —
-it is correct once fed clean staves.
+Brace detection (`crop_piano_pdfs.py`):
+
+| param | value | meaning |
+|---|---|---|
+| `BRACE_DARK` | 170 | < this on the normalized image counts as ink |
+| `BRACE_WIN_L` / `BRACE_WIN_R` | 40 / 140 | left-edge window `[x0-40, x0+140]` (absorbs per-system indent) |
+| `BRACE_MIN_CUSP` | 4.0 | min cusp taper (px) for a primary braced pair |
+| `BRACE_ARGMIN_LO/HI` | 0.28 / 0.72 | the cusp (leftmost) row must lie in this central band |
+| `BRACE_MIN_COV` | 0.70 | min fraction of region rows carrying left-edge ink |
+| `BRACE_RESCUE_CUSP` | 6.0 | stricter taper for the missing-stave rescue |
+| `BRACE_RESCUE_LO/HI` | 0.30 / 0.70 | stricter central band for the rescue |
+
+**Brace detection is the piano signal — see *Brace detection* above.**
+`find_piano_pairs` (bass-clef-via-measure-number) and `group_into_systems` are
+kept for reference but are OFF the detection path; the brace rule supersedes the
+bottom-two-staves heuristic, which misfired.
 
 ---
 
@@ -132,29 +198,38 @@ either way. **iCloud `SRC_DIR` is canonical** for full runs; output goes to
 
 ---
 
-## Last full-run results (42 cues, all pages)
+## Last full-run results (42 cues, all pages — brace detection)
 
-- **Hand In My Pocket:** all 8 pages, 9–10 staves each, 3 regions each, no blobs. ✓
-- **No blobs anywhere:** no stave > 120 px at 200 DPI across all 42 cues. ✓
-- **No fat-regions:** no kept region encloses a 3rd (vocal) stave. ✓
-- **Deskew rescues:** All I Really Want p0/p6/p8/p10/p18 (was 0 staves) now
-  detect; HIMP and other straight pages unchanged (angle 0°).
-- **One legitimate 0-staves page:** You Oughta Know p8 is a near-empty staging
-  page (just a stage-direction arrow) — correctly passes through whole.
+- **Named failures fixed:** Overture p3 (idx2) now 2 regions (was 1 — the faint
+  second-system grand staff is recovered by the missing-stave rescue); Overture
+  p6 (idx5) now 3 regions, all on braced pairs (the braceless vocal pair the old
+  heuristic grabbed is gone).
+- **Hand In My Pocket:** all 8 pages, 3 braced regions each. ✓
+- **No fat-regions:** no kept region encloses a 3rd (vocal) stave, across all 42
+  cues. ✓ (Every emitted region sits on a braced grand staff.)
+- **Recall:** only one 0-region page across all cues — You Oughta Know p8, a
+  near-empty staging page (just a stage-direction arrow), correctly passed
+  through whole. Spot-checked count=4 pages (Perfect, Mary Jane, Bows, All I
+  Really Want, New York, Head Over Feet) and count=1 pages: all correct — the 1s
+  are genuine single-system pages.
 
-### Known residual
+### Known residuals (upstream STAFF detection, not the brace rule)
 
-- **All I Really Want p8** keeps only 1 of its 2 piano systems: the second
-  system's bass stave isn't cleanly detected after deskew (page is slightly
-  warped, not a uniform tilt), so `find_piano_pairs` can't form the second pair.
-  Detection succeeds (9 staves, no blob), but one piano system is dropped rather
-  than kept. Not fixable without touching the (intentionally frozen) pairing
-  logic. Worth a manual check of that single page before final use.
+- **No p7** keeps only the first of its two systems: the bottom system's staves
+  aren't detected (only a 22 px fragment), so there is nothing for the brace
+  logic to confirm. The old code missed it too. A staff-detection gap, not a
+  brace misfire.
+- **All I Really Want p8** keeps only 1 of its 2 piano systems for the same
+  reason — the second system's bass stave isn't cleanly detected on the slightly
+  warped page. Worth a manual check of these pages before final use.
+  These are limits of `staff_detect_v2`; the brace rule is correct on every
+  stave pair it is actually fed.
 
 ### QC verdict
 
 Run `python3 crop_piano_pdfs.py --qc` and open `/tmp/qc/`. The contact sheets
-draw every detected stave (blue) and every kept piano region (red). A correct
-page shows red boxes only on the bottom pair of each system, blue-only on the
-vocal staves above. Anomalies (0-staves, blob, fat-region) are printed to stdout
-and labelled red on the thumbnail.
+draw every detected stave (blue) and every kept piano region (red); each red box
+is a `{`-braced grand staff. A correct page shows red boxes only on the braced
+piano pair of each system (region count == brace count), blue-only on the vocal
+staves above. Anomalies (0-staves, blob, fat-region) are printed to stdout and
+labelled red on the thumbnail.

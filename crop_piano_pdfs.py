@@ -67,6 +67,25 @@ BASS_BELOW_OFFSET   =  8   # skip the first few px (avoids stave bottom bar-line
 BASS_DARK_THRESHOLD = 120  # local-min below_dark < this → bass clef stave
 MAX_PIANO_SPAN      = 350  # max px between top of treble and bottom of bass stave
 
+# Brace detection — the { grand-staff marker (THE ground-truth piano signal).
+# A piano region is a {-braced grand staff: exactly two adjacent staves joined
+# by a curved brace that bulges LEFT at the midpoint between them.  We detect
+# the brace by its left-edge "cusp": within a window just left of the score, the
+# leftmost-ink column dips to its minimum at the grand-staff vertical midpoint
+# and is further right at the two tips (the brace tapers to points top & bottom).
+# A full-system bracket or a barline is straight (no cusp) and is rejected.
+BRACE_DARK          = 170  # < this on the contrast-normalized image counts as ink
+BRACE_WIN_L         = 40   # window starts this many px left of x0 …
+BRACE_WIN_R         = 140  # … and ends this many px right of x0 (spans per-system indent)
+BRACE_MIN_CUSP      = 4.0  # min px the centre cusp must sit left of the tips (taper);
+                           # true braces measure ~4.5–8, straight brackets ~0 or negative
+BRACE_MIN_COV       = 0.70 # min fraction of region rows that carry left-edge ink
+BRACE_ARGMIN_LO     = 0.28 # the leftmost (cusp) row must lie in this central band …
+BRACE_ARGMIN_HI     = 0.72 # … of the region (the grand-staff midpoint)
+BRACE_RESCUE_CUSP   = 6.0  # stricter taper for the missing-stave rescue
+BRACE_RESCUE_LO     = 0.30 # stricter central band for the rescue
+BRACE_RESCUE_HI     = 0.70
+
 # Output quality / PlayScore compatibility
 MIN_STAVE_H_PX      =  6   # reject "staves" shorter than this (spurious lines, arrows)
 MAX_STAVE_H_PX      = 9999 # effectively disabled — tall merged groups are handled downstream
@@ -457,6 +476,139 @@ def find_piano_pairs(
     return regions
 
 
+# ── Brace detection (the { grand-staff marker — primary piano signal) ──────────
+
+def grandstaff_cusp(norm: np.ndarray, top: int, bot: int,
+                    x0: int, x1: int) -> dict:
+    """
+    Measure the brace "cusp" over the candidate grand-staff rows [top, bot].
+
+    In a window just left of the score (wide enough to absorb per-system
+    indentation), take the leftmost-ink column of each row — in the piano
+    grand-staff region the brace is the leftmost vertical structure (the
+    full-system bracket lives in the vocal rows above, never here).  A brace
+    makes this profile dip to a minimum (bulge LEFT) at the vertical midpoint and
+    sit further right at the top and bottom tips; a straight bracket or barline
+    gives a flat profile.
+
+    Returns dict(cov, taper, argmin):
+      • cov    — fraction of rows that carry left-edge ink (structure continuity)
+      • taper  — px the centre cusp sits left of the tips (>0 ⇒ brace-shaped)
+      • argmin — normalized row of the leftmost point (≈0.5 for a real brace)
+    """
+    lo = max(x0 - BRACE_WIN_L, 0)
+    hi = min(x0 + BRACE_WIN_R, x1)
+    hh = bot - top
+    if hh < 60 or hi - lo < 20:
+        return dict(cov=0.0, taper=-99.0, argmin=0.0)
+
+    ink = norm[top:bot, lo:hi] < BRACE_DARK
+    # leftmost column that begins an ink run of >= 2 (ignores single-px specks).
+    # In the piano region the brace is the leftmost vertical structure, so even at
+    # staff-line rows this picks the brace (the staff line starts further right).
+    run2 = ink[:, :-1] & ink[:, 1:]
+    has  = run2.any(axis=1)
+    lm   = np.where(has, run2.argmax(axis=1), np.nan).astype(float)
+
+    cov = float(np.isfinite(lm).mean())
+    if cov < BRACE_MIN_COV:
+        return dict(cov=cov, taper=-99.0, argmin=0.0)
+
+    # 3-tap median smooth to kill single-row spikes
+    sm = lm.copy()
+    for r in range(1, hh - 1):
+        w = lm[r - 1:r + 2]
+        w = w[np.isfinite(w)]
+        if len(w):
+            sm[r] = np.median(w)
+
+    n   = hh
+    cen = sm[int(n * 0.32):int(n * 0.68)]; cen = cen[np.isfinite(cen)]
+    te  = sm[:int(n * 0.20)];              te  = te[np.isfinite(te)]
+    be  = sm[int(n * 0.80):];              be  = be[np.isfinite(be)]
+    if not len(cen) or not len(te) or not len(be):
+        return dict(cov=cov, taper=-99.0, argmin=0.0)
+
+    cmin   = float(np.min(cen))
+    tip    = float(min(np.median(te), np.median(be)))
+    argmin = float(np.nanargmin(np.where(np.isfinite(sm), sm, 1e9)) / n)
+    return dict(cov=cov, taper=tip - cmin, argmin=argmin)
+
+
+def _is_brace(d: dict) -> bool:
+    return (d["taper"] >= BRACE_MIN_CUSP and
+            BRACE_ARGMIN_LO <= d["argmin"] <= BRACE_ARGMIN_HI and
+            d["cov"] >= BRACE_MIN_COV)
+
+
+def find_piano_braces(
+        norm: np.ndarray,
+        staves: list[tuple[int, int]],
+        x0: int, x1: int) -> list[tuple[int, int]]:
+    """
+    Return piano crop regions, one per {-braced grand staff.
+
+    A region is emitted ONLY for a pair of adjacent staves joined by a brace
+    (primary pass), plus a guarded rescue for the case where one piano stave is
+    too faint for the staff detector to find but the brace still proves the grand
+    staff is there (e.g. Overture p3 system 2).  Unbraced pairs — vocal staves,
+    bracketed groups, lone barlines — are never kept.
+
+    Returns padded (y_top, y_bot) regions sorted top-to-bottom.
+    """
+    n = len(staves)
+    if n < 2:
+        return []
+    H = norm.shape[0]
+
+    raw: list[tuple[int, int]] = []          # (treble_top, bass_bot)
+    covered = [False] * n
+
+    # Primary: every adjacent stave pair joined by a brace.
+    for i in range(n - 1):
+        if _is_brace(grandstaff_cusp(norm, staves[i][0], staves[i + 1][1], x0, x1)):
+            raw.append((staves[i][0], staves[i + 1][1]))
+            covered[i] = covered[i + 1] = True
+
+    # Typical grand-staff height — drives the missing-stave rescue window.
+    if raw:
+        drop = int(np.median([b - t for t, b in raw]))
+    else:
+        sh   = int(np.median([b - t for t, b in staves]))
+        drop = 2 * sh + 95
+
+    # Rescue: an uncovered stave whose grand-staff partner was never detected
+    # (a faint piano stave).  Only attempt it where there is room for a missing
+    # stave (a gap larger than a stave on that side), and require a stronger
+    # cusp so we never invent a region under a vocal stave.
+    for i in range(n):
+        if covered[i]:
+            continue
+        t, b = staves[i]
+        sh   = b - t
+        gap_below = (staves[i + 1][0] - b) if i + 1 < n else (H - b)
+        if gap_below > 1.3 * sh:
+            d = grandstaff_cusp(norm, t, min(b + drop, H - 1), x0, x1)
+            if (d["taper"] >= BRACE_RESCUE_CUSP and
+                    BRACE_RESCUE_LO <= d["argmin"] <= BRACE_RESCUE_HI and
+                    d["cov"] >= BRACE_MIN_COV):
+                raw.append((t, min(b + drop, H - 1)))
+                covered[i] = True
+                continue
+        gap_above = (t - staves[i - 1][1]) if i > 0 else t
+        if gap_above > 1.3 * sh:
+            d = grandstaff_cusp(norm, max(t - drop, 0), b, x0, x1)
+            if (d["taper"] >= BRACE_RESCUE_CUSP and
+                    BRACE_RESCUE_LO <= d["argmin"] <= BRACE_RESCUE_HI and
+                    d["cov"] >= BRACE_MIN_COV):
+                raw.append((max(t - drop, 0), b))
+                covered[i] = True
+
+    regions = [(max(t - TOP_PAD_PX, 0), min(b + BOT_PAD_PX, H - 1))
+               for t, b in raw]
+    return sorted(regions)
+
+
 # ── Per-page processing ───────────────────────────────────────────────────────
 
 def detect_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
@@ -499,26 +651,16 @@ def detect_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
     if len(staves) < 2:
         return img, (x0, x1), staves, [], 0, True, angle
 
-    # Primary: bass-clef detection via measure-number signal.
-    # Bass clef staves are local minima in the "dark pixels just below the stave"
-    # profile — measure numbers are small; treble-stave content (notes, lyrics,
-    # chord symbols) is dense.  This works regardless of system count or stave
-    # spacing and is the most direct implementation of the invariant:
-    # "piano grand staff = bass clef stave + the one immediately above it."
-    regions = find_piano_pairs(norm, staves, x0)
-
-    # Fallback: if the measure-number signal found nothing (e.g. the piano staves
-    # are too faint to detect, or the page has only piano-only systems where the
-    # "bottom of the page" has no measure numbers below the last system), fall
-    # back to the system-detection approach.
-    n_systems  = len(regions)   # reported count comes from pairs found
+    # Primary: brace detection — the { grand-staff marker is ground truth.
+    # A piano region is emitted ONLY for a pair of adjacent staves joined by a
+    # brace (the curved { that bulges left at the grand-staff midpoint); an
+    # unbraced pair — vocal staves, a bracketed group, a lone barline — is never
+    # kept.  This replaces the old bottom-two-staves + measure-number heuristic,
+    # which misfired (kept braceless pairs, missed faint-stave grand staves).
+    # find_piano_pairs / group_into_systems remain in this module for reference.
+    regions    = find_piano_braces(norm, staves, x0, x1)
+    n_systems  = len(regions)
     piano_only = False
-    if not regions:
-        systems    = group_into_systems(staves)
-        n_systems  = len(systems)
-        max_staves = max(len(s) for s in systems) if systems else 0
-        piano_only = (max_staves <= 2)
-        regions    = piano_regions(systems, img.shape[0])
 
     return img, (x0, x1), staves, regions, n_systems, piano_only, angle
 

@@ -267,28 +267,10 @@ def detect(page: fitz.Page, dpi: int = DET_DPI):
     if len(staves) < 2:
         return img, (x0, x1), staves, [], "too-few-staves"
 
-    regions = C.find_piano_pairs(C.normalize_contrast(img), staves, x0)
-    method = "measure-num pairs"
-    if not regions:                                   # fallback: system grouping + bottom-2
-        norm = C.normalize_contrast(img)
-        x0b, x1b = C.find_score_x_bounds(norm)
-        centers = [(t + b) // 2 for t, b in staves]
-        line_sp = float(np.median(np.diff(centers))) if len(centers) > 1 else 30.0
-        systems: list[list[tuple[int, int]]] = []
-        cur = [staves[0]]
-        for i in range(1, len(staves)):
-            if staves[i][0] - staves[i - 1][1] > SYS_GAP_K * line_sp:
-                systems.append(cur); cur = [staves[i]]
-            else:
-                cur.append(staves[i])
-        systems.append(cur)
-        regions = []
-        for s in systems:
-            p = s[-2:] if len(s) > 2 else s
-            regions.append((max(p[0][0] - int(0.5 * line_sp), 0),
-                            min(p[-1][1] + int(line_sp), img.shape[0] - 1)))
-        method = "fallback systems"
-    return img, (x0, x1), staves, regions, method
+    # Piano regions come from brace detection (the { grand-staff marker) — see
+    # crop_piano_pdfs.find_piano_braces.  A region is kept only for a braced pair.
+    regions = C.find_piano_braces(C.normalize_contrast(img), staves, x0, x1)
+    return img, (x0, x1), staves, regions, "braced grand staves"
 
 
 if __name__ == "__main__":
