@@ -71,6 +71,25 @@ STAVE_GAP_K   = 1.8    # new stave when line gap > K * median line spacing
 SYS_GAP_K     = 2.6    # new system when stave gap > K * median line spacing (fallback only)
 MIN_STAVE_K   = 2.0    # drop "staves" shorter than K * median line spacing (stray lines)
 
+# ── Structural piano detection (left-edge system segmentation) ────────────────
+# Layout fact (from the music director): every system is vocal stave(s) on top +
+# a 2-stave piano grand staff on the bottom, and the bottom 2 staves of any page
+# are always piano. System boundaries are visible AT THE LEFT EDGE: within a
+# system the staves are bridged by vertical ink (brace/barline) in the left
+# margin; BETWEEN systems that margin is a clean blank gap. So: segment staves
+# into systems by the left-edge connector, then the bottom 2 staves of each
+# system are the piano region.
+LEFTEDGE_BAND_L   = 20    # connector band starts this many px left of x0 …
+LEFTEDGE_BAND_R   = 150   # … and extends this far right (absorbs per-system indent)
+LEFTEDGE_CONN_THR = 0.55  # a gap column inked >= this fraction ⇒ staves bridged (same system)
+LEFTEDGE_BIG_GAP  = 200   # a gap this large is a system boundary regardless of connector
+# Faint-bass rescue: a piano bass stave whose staff lines fall just under the
+# detector's 0.28·w cutoff (Overture p3, Ironic p11, AIRW p9, …) leaves the
+# detected bottom stave as a lone treble. Recover it so the grand staff is whole.
+FAINTBASS_RUN_LO  = 0.16  # sub-threshold staff line: longest run in [LO·w, LINE_RUN_FRAC·w)
+FAINTBASS_MIN_ROWS = 10   # need this many such rows below a stave to call it a faint stave
+FAINTBASS_MAX_K   = 3.0   # search at most this many stave-heights below the treble
+
 
 def _longest_run_rows(dark: np.ndarray) -> np.ndarray:
     """Longest continuous horizontal True-run per row; closes small breaks first."""
@@ -261,16 +280,123 @@ def detect_staves(page: fitz.Page, dpi: int = DET_DPI, deskew: bool = True):
     return img, (x0, x1), staves
 
 
+def _connector_strength(norm: np.ndarray, b: int, t: int, x0: int, x1: int) -> float:
+    """
+    Max fraction of the gap rows [b, t] inked by any single column in the
+    left-margin band.  A brace/barline bridging the gap gives ~1.0 (a full
+    vertical line); a clean between-system margin gives a low value (only stray
+    measure-number / tempo marks, which never span the gap vertically).  The band
+    is wide on the right so an indented system's connector still falls inside it.
+    """
+    lo = max(x0 - LEFTEDGE_BAND_L, 0)
+    hi = min(x0 + LEFTEDGE_BAND_R, x1)
+    seg = norm[b:t, lo:hi] < DARK_THRESH
+    if seg.shape[0] < 3 or seg.size == 0:
+        return 0.0
+    return float(seg.mean(axis=0).max())
+
+
+def group_into_systems_by_edge(
+        norm: np.ndarray, staves: list[tuple[int, int]],
+        x0: int, x1: int) -> list[list[int]]:
+    """
+    Group staves into systems by the LEFT-EDGE connector.  Boundary between
+    adjacent staves when the margin is blank (no bridging column) OR the gap is
+    very large (a faint missing stave can blow a within-system gap past any
+    plausible size — that is still a boundary at this level; the bass is recovered
+    later by the faint-bass rescue).  Returns lists of stave indices.
+    """
+    n = len(staves)
+    if n == 0:
+        return []
+    systems: list[list[int]] = []
+    cur = [0]
+    for i in range(1, n):
+        gap = staves[i][0] - staves[i - 1][1]
+        bridged = _connector_strength(norm, staves[i - 1][1], staves[i][0], x0, x1)
+        if bridged < LEFTEDGE_CONN_THR or gap > LEFTEDGE_BIG_GAP:
+            systems.append(cur); cur = [i]
+        else:
+            cur.append(i)
+    systems.append(cur)
+    return systems
+
+
+def _faint_bass_below(runs: np.ndarray, w: int, stave_bot: int,
+                      sh: int, limit_y: int) -> tuple[int, int] | None:
+    """
+    Look for a piano bass stave whose lines are too faint for the 0.28·w cutoff,
+    sitting below `stave_bot` (the detected piano treble).  Returns the (top, bot)
+    row span of the sub-threshold staff-line cluster, or None.  Bounded to one
+    grand-staff drop and to the next detected stave so it never reaches into the
+    system below.
+    """
+    lo = stave_bot + int(0.4 * sh)
+    hi = min(stave_bot + int(FAINTBASS_MAX_K * sh), limit_y)
+    rows = [y for y in range(lo, hi)
+            if FAINTBASS_RUN_LO * w <= runs[y] < LINE_RUN_FRAC * w]
+    if len(rows) < FAINTBASS_MIN_ROWS:
+        return None
+    return rows[0], rows[-1]
+
+
+def find_piano_systems(
+        norm: np.ndarray, staves: list[tuple[int, int]],
+        x0: int, x1: int) -> tuple[list[tuple[int, int]], list[str]]:
+    """
+    Structural piano-region rule: the bottom 2 staves of each left-edge-segmented
+    system are the piano grand staff.  Returns (regions, flags); `flags` are QC
+    notes (faint-bass rescues, lone staves, anchor failures) for manual review.
+    """
+    n = len(staves)
+    if n < 2:
+        return [], (["%d-stave-page" % n] if n else [])
+
+    w = x1 - x0
+    runs = _longest_run_rows(norm[:, x0:x1] < DARK_THRESH)
+    sh = int(np.median([b - t for t, b in staves]))
+    systems = group_into_systems_by_edge(norm, staves, x0, x1)
+
+    regions: list[tuple[int, int]] = []
+    flags: list[str] = []
+    for sysix in systems:
+        bot_i = sysix[-1]
+        bt, bb = staves[bot_i]
+        next_top = staves[bot_i + 1][0] if bot_i + 1 < n else norm.shape[0]
+        faint = _faint_bass_below(runs, w, bb, sh, next_top)
+        if faint is not None:
+            # the detected bottom stave is the piano TREBLE; recover its faint bass
+            top, bottom = bt, faint[1]
+            flags.append("rescued-bass@stave%d" % bot_i)
+        elif len(sysix) >= 2:
+            top, bottom = staves[sysix[-2]][0], bb       # bottom 2 detected staves
+        else:
+            flags.append("lone-stave@stave%d" % bot_i)   # 1-stave system, no bass — skip
+            continue
+        regions.append((max(top - C.TOP_PAD_PX, 0),
+                        min(bottom + C.BOT_PAD_PX, norm.shape[0] - 1)))
+
+    regions.sort()
+    # Sanity: the page's bottom stave (guaranteed piano) must land in a region.
+    if regions and not any(rt - 5 <= staves[-1][0] and staves[-1][1] <= rb + 5
+                           for rt, rb in regions):
+        flags.append("bottom-anchor-miss")
+    return regions, flags
+
+
 def detect(page: fitz.Page, dpi: int = DET_DPI):
     """Full detection → (img, (x0,x1), staves, piano_regions, method)."""
     img, (x0, x1), staves = detect_staves(page, dpi)
     if len(staves) < 2:
         return img, (x0, x1), staves, [], "too-few-staves"
 
-    # Piano regions come from brace detection (the { grand-staff marker) — see
-    # crop_piano_pdfs.find_piano_braces.  A region is kept only for a braced pair.
-    regions = C.find_piano_braces(C.normalize_contrast(img), staves, x0, x1)
-    return img, (x0, x1), staves, regions, "braced grand staves"
+    # Piano regions from the STRUCTURAL rule: bottom 2 staves of each left-edge
+    # segmented system (see find_piano_systems).
+    regions, flags = find_piano_systems(C.normalize_contrast(img), staves, x0, x1)
+    method = "structural systems"
+    if flags:
+        method += " [" + ",".join(flags) + "]"
+    return img, (x0, x1), staves, regions, method
 
 
 if __name__ == "__main__":

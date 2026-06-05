@@ -615,13 +615,14 @@ def detect_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
     """
     Run the full detection pipeline for one page.
 
-    Returns (img, (x0, x1), staves, regions, n_systems, piano_only, angle) where
-    img is the deskewed detection-DPI render, staves are individual (top, bot)
-    bands, regions are the kept piano (top, bot) crop bands (all in detection-DPI
-    rows of the deskewed frame), and angle is the deskew rotation in degrees.
-    Shared by process_page (output) and the QC contact sheet so both report
-    exactly the same kept regions; process_page re-applies `angle` to the
-    high-DPI output render so the regions line up.
+    Returns (img, (x0, x1), staves, regions, n_systems, piano_only, angle, flags)
+    where img is the deskewed detection-DPI render, staves are individual
+    (top, bot) bands, regions are the kept piano (top, bot) crop bands (all in
+    detection-DPI rows of the deskewed frame), angle is the deskew rotation in
+    degrees, and flags are structural QC notes (faint-bass rescues, lone staves,
+    anchor failures) for manual review.  Shared by process_page (output) and the
+    QC contact sheet so both report exactly the same kept regions; process_page
+    re-applies `angle` to the high-DPI output render so the regions line up.
     """
     # Staff detection (continuous-run detector — see staff_detect_v2 docstring).
     # We render here (not via detect_staves) so the SAME deskew angle drives both
@@ -649,20 +650,21 @@ def detect_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
     norm = normalize_contrast(img)
 
     if len(staves) < 2:
-        return img, (x0, x1), staves, [], 0, True, angle
+        return img, (x0, x1), staves, [], 0, True, angle, []
 
-    # Primary: brace detection — the { grand-staff marker is ground truth.
-    # A piano region is emitted ONLY for a pair of adjacent staves joined by a
-    # brace (the curved { that bulges left at the grand-staff midpoint); an
-    # unbraced pair — vocal staves, a bracketed group, a lone barline — is never
-    # kept.  This replaces the old bottom-two-staves + measure-number heuristic,
-    # which misfired (kept braceless pairs, missed faint-stave grand staves).
-    # find_piano_pairs / group_into_systems remain in this module for reference.
-    regions    = find_piano_braces(norm, staves, x0, x1)
+    # Primary: the STRUCTURAL rule (staff_detect_v2.find_piano_systems).  Group
+    # staves into systems by the left-edge connector (vertical brace/barline ink
+    # bridges staves within a system; the margin is blank between systems), then
+    # the bottom 2 staves of each system are the piano grand staff.  A faint piano
+    # bass (lines just under the staff-detection cutoff) is recovered so the grand
+    # staff is whole.  Replaces the brace-pixel detector (find_piano_braces) and
+    # the bottom-two + measure-number heuristic (find_piano_pairs), both kept for
+    # reference.  `flags` carry QC notes for manual review.
+    regions, flags = staff_detect_v2.find_piano_systems(norm, staves, x0, x1)
     n_systems  = len(regions)
     piano_only = False
 
-    return img, (x0, x1), staves, regions, n_systems, piano_only, angle
+    return img, (x0, x1), staves, regions, n_systems, piano_only, angle, flags
 
 
 def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
@@ -680,7 +682,7 @@ def process_page(page: fitz.Page, dpi: int = ANALYSIS_DPI):
     warnings: list[str] = []
 
     import staff_detect_v2
-    img, (x0, x1), staves, regions, n_systems, piano_only, angle = detect_page(page, dpi)
+    img, (x0, x1), staves, regions, n_systems, piano_only, angle, flags = detect_page(page, dpi)
 
     # Output is rendered fresh at OUTPUT_DPI; detection coordinates (200 DPI)
     # are scaled to it by this ratio.  Keeping the page whole means re-rendering
@@ -732,15 +734,18 @@ BLOB_H_PX = 120   # a stave taller than this at detection DPI is a detection-fai
 
 
 def page_anomalies(staves: list[tuple[int, int]],
-                   regions: list[tuple[int, int]]) -> list[str]:
+                   regions: list[tuple[int, int]],
+                   flags: list[str] | None = None) -> list[str]:
     """
     Flag detection problems on one page (coordinates at detection DPI):
       • '0-staves'    — nothing detected (skewed scan or title page)
       • 'blob'        — a merged stave taller than BLOB_H_PX (detection failure)
       • 'fat-region'  — a kept region enclosing >2 staves, i.e. a vocal stave
                         slipped into the piano crop (proxy for visual check (c))
+      • structural flags from find_piano_systems (faint-bass rescues, lone
+        staves, bottom-anchor misses) — passed through for manual review.
     """
-    out: list[str] = []
+    out: list[str] = list(flags or [])
     if len(staves) == 0:
         out.append("0-staves")
     tall = [b - t for t, b in staves if (b - t) > BLOB_H_PX]
@@ -767,7 +772,7 @@ def qc_contact_sheet(src: Path, out_png: Path, dpi: int = ANALYSIS_DPI,
     found: list[tuple[int, list[str]]] = []
 
     for i in range(len(doc)):
-        img, (x0, x1), staves, regions, _, _, _ = detect_page(doc[i], dpi)
+        img, (x0, x1), staves, regions, _, _, _, flags = detect_page(doc[i], dpi)
         H, W = img.shape
         sc = thumb_w / W
         th = max(int(H * sc), 1)
@@ -779,7 +784,7 @@ def qc_contact_sheet(src: Path, out_png: Path, dpi: int = ANALYSIS_DPI,
         for r_t, r_b in regions:                      # kept piano regions → red
             d.rectangle([xa, r_t * sc, xb, r_b * sc], outline=(225, 0, 0), width=2)
 
-        anom = page_anomalies(staves, regions)
+        anom = page_anomalies(staves, regions, flags)
         if anom:
             found.append((i, anom))
         label = f"p{i}  staves={len(staves)} regions={len(regions)}"
