@@ -15,7 +15,7 @@ from copy import deepcopy
 from statistics import median as _median
 
 from jlp_common import (
-    EXPORTS_DIR, INSTRUMENTS, CUE_TEMPOS, GM_DEFAULT,
+    EXPORTS_DIR, INSTRUMENTS, CUE_TEMPOS, GM_DEFAULT, cue_tempo, sound_tempo,
     ensure_exports_dir, resolve_output,
 )
 
@@ -178,16 +178,17 @@ def _has_tempo(root) -> bool:
     return root.find(".//metronome") is not None
 
 
-def _inject_tempo_direction(measure_el, bpm: int):
+def _inject_tempo_direction(measure_el, bpm: int, beat_unit: str = "quarter"):
     d  = ET.Element("direction", placement="above")
     dt = ET.SubElement(d, "direction-type")
     mt = ET.SubElement(dt, "metronome")
     bu = ET.SubElement(mt, "beat-unit")
-    bu.text = "quarter"
+    bu.text = beat_unit
     pm = ET.SubElement(mt, "per-minute")
     pm.text = str(bpm)
     s  = ET.SubElement(d, "sound")
-    s.set("tempo", str(bpm))
+    # <sound tempo> is always in quarter notes (half-note 93 → quarter-note 186).
+    s.set("tempo", str(sound_tempo(bpm, beat_unit)))
     insert_pos = 0
     for i, child in enumerate(list(measure_el)):
         if child.tag in ("note", "harmony", "barline"):
@@ -196,14 +197,14 @@ def _inject_tempo_direction(measure_el, bpm: int):
     measure_el.insert(insert_pos, d)
 
 
-def inject_tempo(part_el, measure_number: int, bpm: int):
+def inject_tempo(part_el, measure_number: int, bpm: int, beat_unit: str = "quarter"):
     for m in part_el.findall("measure"):
         if m.get("number") == str(measure_number):
-            _inject_tempo_direction(m, bpm)
+            _inject_tempo_direction(m, bpm, beat_unit)
             return
     measures = part_el.findall("measure")
     if measures:
-        _inject_tempo_direction(measures[0], bpm)
+        _inject_tempo_direction(measures[0], bpm, beat_unit)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -444,12 +445,14 @@ def mode_merge(args):
     if src_has_tempo:
         tempo_info = "found in source"
     else:
-        bpm = CUE_TEMPOS.get(cue)
-        if bpm is not None:
-            inject_tempo(merged, 1, bpm)
-            print(f"  [WARNING] Tempo not in source; injected {bpm} BPM "
+        tempo = cue_tempo(cue)
+        if tempo is not None:
+            bpm, beat_unit = tempo
+            inject_tempo(merged, 1, bpm, beat_unit)
+            unit_note = "" if beat_unit == "quarter" else f" ({beat_unit} note)"
+            print(f"  [WARNING] Tempo not in source; injected {bpm} BPM{unit_note} "
                   f"from cue table (cue {cue})")
-            tempo_info = f"injected {bpm} BPM (WARNING: verify against score)"
+            tempo_info = f"injected {bpm} BPM{unit_note} (WARNING: verify against score)"
         else:
             print(f"  [WARNING] Cue {cue!r} not in tempo table and no tempo "
                   f"found in source — no tempo injected")
@@ -547,13 +550,19 @@ def mode_assemble(args):
     size = write_mxl(ET.ElementTree(score), out_path)
     print(f"\nWrote {out_path}  ({size:,} bytes XML)")
 
-    cue_bpm = CUE_TEMPOS.get(cue, "not in table")
+    cue_t = cue_tempo(cue)
+    if cue_t is None:
+        cue_tempo_ref = f"none (cue {cue})"
+    else:
+        _bpm, _unit = cue_t
+        _unit_note = "" if _unit == "quarter" else f" ({_unit} note)"
+        cue_tempo_ref = f"{_bpm} BPM{_unit_note}"
     _print_summary({
         "Mode":             "assemble",
         "Cue":              cue,
         "Instruments":      instruments_included,
         "Total measures":   str(max_m),
-        "Cue tempo (ref)":  f"{cue_bpm} BPM" if cue_bpm else f"none (cue {cue})",
+        "Cue tempo (ref)":  cue_tempo_ref,
         "Output":           str(out_path),
     })
 

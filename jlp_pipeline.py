@@ -6,7 +6,7 @@ Phases:
   check     Scan raw/ XMLs vs source PDFs; generate next-chunk PDFs
   merge     Merge complete raw/ XML sets into per-instrument MXLs
   assemble  Combine per-instrument MXLs into full-score MXLs
-  status    Print progress table (44 cues × 8 instruments)
+  status    Print progress table (cues × instruments; percussion excluded)
 
 Usage:
   python jlp_pipeline.py --phase check
@@ -33,7 +33,8 @@ from jlp_common import (
     SOURCE_DIR, EXPORTS_DIR, RAW_DIR, NEXT_DIR,
     MERGED_DIR, ASSEMBLED_DIR, TRASH_DIR, TRASH_MERGED_DIR,
     STATE_FILE, OVERRIDES_FILE, PUNCHLIST_FILE, TOTALS_FILE, ANSWERS_FILE,
-    ALL_DIRS, INSTRUMENTS, CUE_TEMPOS, GM_DEFAULT,
+    ALL_DIRS, INSTRUMENTS, KNOWN_INSTRUMENTS, CUE_TEMPOS, GM_DEFAULT,
+    cue_tempo, sound_tempo,
 )
 
 try:
@@ -105,7 +106,7 @@ def parse_xml_name(path: Path):
     if len(parts) < 4 or parts[0].upper() != "JLP":
         return None
     inst = parts[1].lower()
-    if inst not in INSTRUMENTS:
+    if inst not in KNOWN_INSTRUMENTS:
         return None
     cue = parts[2].upper()
     # Last part is a suffix if it's an all-lowercase string >= 'b'
@@ -146,7 +147,7 @@ def parse_playscorename(path: Path):
 
     # Match instrument — longest first to avoid "guitar" matching before "guitar1"
     inst = None
-    for candidate in sorted(INSTRUMENTS, key=len, reverse=True):
+    for candidate in sorted(KNOWN_INSTRUMENTS, key=len, reverse=True):
         if rest.lower().startswith(candidate.lower()):
             inst = candidate
             rest = rest[len(candidate):]
@@ -194,7 +195,7 @@ def parse_merged_name(path: Path):
     if len(parts) < 4 or parts[0].upper() != "JLP":
         return None
     inst = parts[1].lower()
-    if inst not in INSTRUMENTS:
+    if inst not in KNOWN_INSTRUMENTS:
         return None
     cue = parts[2].upper()
     title = ".".join(parts[3:])
@@ -252,7 +253,7 @@ def _parse_chunk_pdf_name(path: Path):
     if len(parts) < 5 or parts[0].upper() != "JLP":
         return None
     inst = parts[1].lower()
-    if inst not in INSTRUMENTS:
+    if inst not in KNOWN_INSTRUMENTS:
         return None
     cue  = parts[2].upper()
     last = parts[-1]
@@ -599,14 +600,16 @@ def _has_tempo(root) -> bool:
     return root.find(".//metronome") is not None
 
 
-def _inject_tempo_direction(measure_el, bpm: int):
+def _inject_tempo_direction(measure_el, bpm: int, beat_unit: str = "quarter"):
     d  = ET.Element("direction", placement="above")
     dt = ET.SubElement(d, "direction-type")
     mt = ET.SubElement(dt, "metronome")
-    ET.SubElement(mt, "beat-unit").text  = "quarter"
+    ET.SubElement(mt, "beat-unit").text  = beat_unit
     ET.SubElement(mt, "per-minute").text = str(bpm)
     s  = ET.SubElement(d, "sound")
-    s.set("tempo", str(bpm))
+    # <sound tempo> is always in quarter notes regardless of the displayed
+    # beat unit (half-note 93 → quarter-note 186).
+    s.set("tempo", str(sound_tempo(bpm, beat_unit)))
     insert_pos = 0
     for i, child in enumerate(list(measure_el)):
         if child.tag in ("note", "harmony", "barline"):
@@ -615,14 +618,14 @@ def _inject_tempo_direction(measure_el, bpm: int):
     measure_el.insert(insert_pos, d)
 
 
-def inject_tempo(part_el, measure_number: int, bpm: int):
+def inject_tempo(part_el, measure_number: int, bpm: int, beat_unit: str = "quarter"):
     for m in part_el.findall("measure"):
         if m.get("number") == str(measure_number):
-            _inject_tempo_direction(m, bpm)
+            _inject_tempo_direction(m, bpm, beat_unit)
             return
     measures = part_el.findall("measure")
     if measures:
-        _inject_tempo_direction(measures[0], bpm)
+        _inject_tempo_direction(measures[0], bpm, beat_unit)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1151,7 +1154,7 @@ def phase_check(args):
             inst_mc, cue_mc = token.split(":", 1)
             inst_mc = inst_mc.lower()
             cue_mc  = cue_mc.upper()
-            if inst_mc not in INSTRUMENTS:
+            if inst_mc not in KNOWN_INSTRUMENTS:
                 print(f"[warning] --mark-complete: unknown instrument {inst_mc!r}")
                 continue
             key = f"{inst_mc}.{cue_mc}"
@@ -1852,10 +1855,12 @@ def _merge_group(inst: str, cue: str, title: str, xml_paths: list):
 
     # Tempo
     if not src_has_tempo:
-        bpm = CUE_TEMPOS.get(cue)
-        if bpm is not None:
-            inject_tempo(merged, 1, bpm)
-            print(f"   [tempo] injected {bpm} BPM from cue table")
+        tempo = cue_tempo(cue)
+        if tempo is not None:
+            bpm, beat_unit = tempo
+            inject_tempo(merged, 1, bpm, beat_unit)
+            unit_note = "" if beat_unit == "quarter" else f" ({beat_unit} note)"
+            print(f"   [tempo] injected {bpm} BPM{unit_note} from cue table")
         else:
             print(f"   [warning] no tempo for cue {cue}; none injected")
 
@@ -2066,6 +2071,11 @@ def phase_assemble(args):
 
     for (cue, title), inst_files in sorted(cue_groups.items()):
         out_path  = ASSEMBLED_DIR / f"JLP.{cue}.{title}.full.mxl"
+        # Percussion is handled separately in Logic Pro — never assemble it into
+        # the full score, even if a stray percussion MXL lingers in merged/.
+        inst_files = [(i, p) for i, p in inst_files if i != "percussion"]
+        if not inst_files:
+            continue
         inst_list = [i for i, _ in inst_files]
 
         # ── Skip / reassemble decision ────────────────────────────────────────
@@ -2127,7 +2137,9 @@ def phase_assemble(args):
 
         for idx, (inst, part) in enumerate(loaded):
             pid = f"P{idx + 1}"
-            ch  = 10 if inst == "percussion" else 1
+            # Percussion is filtered out above, so assembled parts are always
+            # pitched instruments on channel 1.
+            ch  = 1
             pl.append(make_score_part_el(pid, inst, ch))
             current = len(part.findall("measure"))
             if current < max_m:
@@ -2536,7 +2548,7 @@ def phase_status(args):
     # Pre-compute
     table = {(inst, cue): cell(inst, cue) for cue in sorted_cues for inst in INSTRUMENTS}
 
-    abbrevs = ["bass", "cello", "gtr1", "gtr2", "perc", "viola", "violin", "piano", "Full"]
+    abbrevs = ["bass", "cello", "gtr1", "gtr2", "viola", "violin", "piano", "Full"]
     cue_w   = 6
     col_w   = 11   # wide enough for PARTIAL(N)
 
@@ -2782,8 +2794,9 @@ phases:
     p.add_argument("--phase", default=None,
                    choices=["check", "merge", "assemble", "status", "punchlist"])
     p.add_argument("--cue",        default=None, help="Filter to one cue, e.g. 01  01A")
-    p.add_argument("--instrument", default=None, choices=INSTRUMENTS,
-                   help="Filter to one instrument")
+    p.add_argument("--instrument", default=None, choices=KNOWN_INSTRUMENTS,
+                   help="Filter to one instrument (percussion accepted for "
+                        "check/merge only; it is excluded from assembly/status)")
     p.add_argument("--force", action="store_true",
                    help="assemble: bypass missing-instrument check (allow partial scores); "
                         "other phases: re-process even if output already exists / result cached")
